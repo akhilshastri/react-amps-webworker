@@ -1,0 +1,15 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/protocol" },
+    { "path": "packages/amps-client" },
+    { "path": "packages/viewport-core" },
+    { "path": "packages/data-worker" },
+    { "path": "packages/worker-client" },
+    { "path": "packages/grid-viewport" },
+    { "path": "packages/ui" },
+    { "path": "packages/feature-orders" },
+    { "path": "packages/feature-order-details" },
+    { "path": "apps/trading-ui" }
+  ]
+}

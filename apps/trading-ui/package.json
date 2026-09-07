@@ -1,0 +1,30 @@
+{
+  "name": "@amps-ui/trading-ui",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@amps-ui/data-worker": "workspace:*",
+    "@amps-ui/feature-order-details": "workspace:*",
+    "@amps-ui/feature-orders": "workspace:*",
+    "@amps-ui/grid-viewport": "workspace:*",
+    "@amps-ui/protocol": "workspace:*",
+    "@amps-ui/ui": "workspace:*",
+    "@amps-ui/worker-client": "workspace:*",
+    "ag-grid-community": "36.1.0",
+    "flexlayout-react": "0.10.8",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "4.3.3",
+    "@vitejs/plugin-react": "^4.3.4",
+    "tailwindcss": "4.3.3",
+    "vite": "7.3.6"
+  }
+}

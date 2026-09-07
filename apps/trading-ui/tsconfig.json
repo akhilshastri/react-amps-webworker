@@ -1,0 +1,20 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "types": ["vite/client"],
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../../packages/data-worker" },
+    { "path": "../../packages/feature-order-details" },
+    { "path": "../../packages/feature-orders" },
+    { "path": "../../packages/grid-viewport" },
+    { "path": "../../packages/protocol" },
+    { "path": "../../packages/ui" },
+    { "path": "../../packages/worker-client" }
+  ]
+}

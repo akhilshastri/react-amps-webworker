@@ -1,0 +1,15 @@
+/* M3B: Tailwind v4 engine + shadcn theme tokens, owned by @amps-ui/ui (see
+   that package's index.css for the source-detection note) plus the
+   flexlayout-react tab/tabset theme. Both are needed to mount the shell. */
+@import "@amps-ui/ui/index.css";
+@import "flexlayout-react/style/light.css";
+
+/* M2's bare page needs the grid to fill the viewport -- without this, the
+   default browser body margin plus an unsized #root collapses AG Grid's
+   height to 0. Still required by the shell, which also fills the viewport. */
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
