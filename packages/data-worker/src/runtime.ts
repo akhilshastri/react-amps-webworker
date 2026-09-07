@@ -150,7 +150,11 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
    * re-opening never silently resets state that logically survives it (plan
    * §3/§4) -- see `OpenOptions`'s own doc comment.
    */
-  function createState(spec: SubscriptionSpec, epoch: Epoch, options: OpenOptions): SubscriptionState {
+  function createState(
+    spec: SubscriptionSpec,
+    epoch: Epoch,
+    options: OpenOptions,
+  ): SubscriptionState {
     const rowStore = new RowStore();
     const fields =
       options.sortFields.length > 0
@@ -477,12 +481,18 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
     if (subscriptions.get(subId) !== state) return; // superseded meanwhile
     const window = state.spec.window;
     if (!window) return;
-    await reissue(subId, state, { window: { topN: window.topN, skipN: repage.skipN } }, state.epoch, {
-      sortFields: state.sortFields,
-      clientFilter: state.clientFilter,
-      rowCountHint: state.rowCountHint,
-      initialViewport: { firstRow: repage.localFirstRow, lastRow: repage.localLastRow },
-    });
+    await reissue(
+      subId,
+      state,
+      { window: { topN: window.topN, skipN: repage.skipN } },
+      state.epoch,
+      {
+        sortFields: state.sortFields,
+        clientFilter: state.clientFilter,
+        rowCountHint: state.rowCountHint,
+        initialViewport: { firstRow: repage.localFirstRow, lastRow: repage.localLastRow },
+      },
+    );
   }
 
   /**
@@ -603,17 +613,11 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
       // subscription with a new AMPS `orderBy` instead of re-indexing
       // locally. The window (if any) is preserved -- only the ranking
       // AMPS uses to fill it changes.
-      await reissue(
-        msg.subId,
-        state,
-        { orderBy: buildOrderBy(msg.sort.fields) },
-        msg.epoch,
-        {
-          sortFields: msg.sort.fields,
-          clientFilter: msg.clientFilter ?? state.clientFilter,
-          rowCountHint: msg.rowCountHint ?? state.rowCountHint,
-        },
-      );
+      await reissue(msg.subId, state, { orderBy: buildOrderBy(msg.sort.fields) }, msg.epoch, {
+        sortFields: msg.sort.fields,
+        clientFilter: msg.clientFilter ?? state.clientFilter,
+        rowCountHint: msg.rowCountHint ?? state.rowCountHint,
+      });
       return;
     }
 

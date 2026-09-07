@@ -10,6 +10,17 @@
 // the instanceId/subId already, with no extra lookup needed; see
 // `shell-layout.tsx`'s `onAction` handler).
 //
+// `sourceOrdersTabId` (M4b addition, not in the plan's original §5 model --
+// flagged): the plan's Goal is "multi-selecting rows in the orders master
+// grid drives a live order_details subscription", but selection is per-tab
+// (plan §5) and tabs are otherwise independent instances with no built-in
+// relationship. Something has to record WHICH orders tab a given
+// order-details tab's selection follows -- this is that pointer, set once
+// at tab-creation time (the two startup tabs are paired this way) and
+// carried by clone (`tab-actions.ts`), which severs it (see there for why).
+// A details tab with no `sourceOrdersTabId` (severed by a clone, or created
+// standalone) reads its OWN per-tab selection slot instead (`tab-state.tsx`).
+//
 // Consumed by: `shell-layout.tsx` (initial model, factory dispatch),
 // `tab-actions.ts` (cloning).
 import type { IJsonModel, IJsonTabNode } from 'flexlayout-react';
@@ -19,6 +30,8 @@ export type TabKind = 'orders' | 'order-details';
 export interface TabConfig {
   readonly kind: TabKind;
   readonly instanceId: string;
+  /** Only meaningful for `kind: 'order-details'` -- see module header. */
+  readonly sourceOrdersTabId?: string;
 }
 
 const TAB_NAME: Record<TabKind, string> = {
@@ -30,16 +43,15 @@ const TAB_NAME: Record<TabKind, string> = {
 export const GRID_COMPONENT = 'grid';
 
 /**
- * Builds one tab's JSON node. Defaults to a fresh `instanceId` (a new grid
- * instance / subId); cloning (`tab-actions.ts`) passes an explicit one only
- * when copying is not the goal, which it never is for a clone -- clones
- * always get a fresh id, only the config's `kind` and separately-tracked
- * per-tab state are copied (plan §5: "a fresh `instanceId` and therefore a
- * fresh `subId`. The clone then diverges").
+ * Builds one tab's JSON node. Always a fresh `instanceId` (a new grid
+ * instance / subId) -- cloning (`tab-actions.ts`) never reuses one, only
+ * the config's `kind` and separately-tracked per-tab state are copied (plan
+ * §5: "a fresh `instanceId` and therefore a fresh `subId`. The clone then
+ * diverges").
  */
-export function createTabJson(kind: TabKind): IJsonTabNode {
+export function createTabJson(kind: TabKind, sourceOrdersTabId?: string): IJsonTabNode {
   const instanceId = crypto.randomUUID();
-  const config: TabConfig = { kind, instanceId };
+  const config: TabConfig = { kind, instanceId, sourceOrdersTabId };
   return {
     type: 'tab',
     id: instanceId,
@@ -50,6 +62,10 @@ export function createTabJson(kind: TabKind): IJsonTabNode {
 }
 
 export function createInitialModelJson(): IJsonModel {
+  const ordersTab = createTabJson('orders');
+  const ordersInstanceId = (ordersTab.config as TabConfig).instanceId;
+  const detailsTab = createTabJson('order-details', ordersInstanceId);
+
   return {
     global: {
       tabEnableClose: true,
@@ -61,7 +77,7 @@ export function createInitialModelJson(): IJsonModel {
       children: [
         {
           type: 'tabset',
-          children: [createTabJson('orders'), createTabJson('order-details')],
+          children: [ordersTab, detailsTab],
         },
       ],
     },

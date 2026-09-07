@@ -11,11 +11,12 @@
 // "the active tab" is unambiguous per click.
 import { Actions, DockLocation, type Model, TabNode, type TabSetNode } from 'flexlayout-react';
 import { type TabConfig, createTabJson } from './model';
+import type { TabStateContextValue } from './tab-state';
 
 export function cloneActiveTab(
   model: Model,
   tabSetNode: TabSetNode,
-  cloneState: (fromInstanceId: string, toInstanceId: string) => void,
+  tabState: Pick<TabStateContextValue, 'getState' | 'setState' | 'cloneState'>,
 ): void {
   const active = tabSetNode.getSelectedNode();
   if (!(active instanceof TabNode)) return;
@@ -23,9 +24,22 @@ export function cloneActiveTab(
   const sourceConfig = active.getConfig() as TabConfig | undefined;
   if (!sourceConfig) return;
 
+  // A clone never carries `sourceOrdersTabId` forward (plan §5: "the clone
+  // then diverges ... fully independent from the moment it is created") --
+  // a details clone that kept live-following the same orders tab would not
+  // be independent, it would just be a second window onto the same state.
   const cloneJson = createTabJson(sourceConfig.kind);
   const cloneConfig = cloneJson.config as TabConfig;
-  cloneState(sourceConfig.instanceId, cloneConfig.instanceId);
+
+  if (sourceConfig.kind === 'order-details') {
+    // A details tab's own tab-state slot is never written directly -- it
+    // reads through `sourceOrdersTabId` (`model.ts`) -- so `cloneState`
+    // would copy an empty snapshot. Resolve what it currently shows first.
+    const resolvedId = sourceConfig.sourceOrdersTabId ?? sourceConfig.instanceId;
+    tabState.setState(cloneConfig.instanceId, tabState.getState(resolvedId));
+  } else {
+    tabState.cloneState(sourceConfig.instanceId, cloneConfig.instanceId);
+  }
 
   model.doAction(Actions.addTab(cloneJson, tabSetNode.getId(), DockLocation.CENTER, -1, true));
 }

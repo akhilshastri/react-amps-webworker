@@ -968,7 +968,11 @@ describe('createWorkerRuntime', () => {
         return `k${String(i).padStart(4, '0')}`;
       }
 
-      async function openWindowed(runtime: ReturnType<typeof createWorkerRuntime>, fake: ReturnType<typeof fakeConnection>, subId: SubscriptionId) {
+      async function openWindowed(
+        runtime: ReturnType<typeof createWorkerRuntime>,
+        fake: ReturnType<typeof fakeConnection>,
+        subId: SubscriptionId,
+      ) {
         await runtime.handleMessage({
           v: 2,
           type: 'sub.open',

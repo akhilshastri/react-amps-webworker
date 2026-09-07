@@ -94,7 +94,12 @@ export class DataClient {
   /** Used by `SubscriptionHandle.update`. Bumps and returns the subscription's new epoch. */
   updateSubscription(
     subId: SubscriptionId,
-    patch: { filter?: string; sort?: SortSpec; clientFilter?: ClientFilterSpec },
+    patch: {
+      filter?: string;
+      sort?: SortSpec;
+      clientFilter?: ClientFilterSpec;
+      rowCountHint?: number;
+    },
   ): Epoch {
     const epoch = this.allocateEpoch(subId);
     this.post({ v: PROTOCOL_VERSION, type: 'sub.update', subId, ...patch, epoch });

@@ -28,9 +28,17 @@ export class SubscriptionHandle {
   /**
    * Sends `sub.update`. A `filter` change makes the worker re-issue to
    * AMPS; a sort/clientFilter-only change re-indexes in place (plan §3).
-   * Returns the new epoch this subscription is now on.
+   * `rowCountHint` (M4b addition -- see `SubOpenRequest.rowCountHint`,
+   * protocol/requests.ts) carries the true row count forward across a
+   * filter-driven re-subscription of a windowed subscription. Returns the
+   * new epoch this subscription is now on.
    */
-  update(patch: { filter?: string; sort?: SortSpec; clientFilter?: ClientFilterSpec }): Epoch {
+  update(patch: {
+    filter?: string;
+    sort?: SortSpec;
+    clientFilter?: ClientFilterSpec;
+    rowCountHint?: number;
+  }): Epoch {
     return this.client.updateSubscription(this.subId, patch);
   }
 
