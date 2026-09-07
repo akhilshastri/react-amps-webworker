@@ -7,10 +7,20 @@ import type { ConnState } from '@amps-ui/protocol';
 import type { DataClient } from '@amps-ui/worker-client';
 import { useEffect, useState } from 'react';
 
-export function useConnectionState(client: DataClient): ConnState {
-  const [state, setState] = useState<ConnState>(() => client.getConnState());
+/**
+ * `client` is `undefined` for the brief window before `Shell`'s own effect
+ * has constructed it (see `shell.tsx`'s header for why that's gated behind
+ * an effect rather than a `useState` lazy initializer) -- reads as `'idle'`
+ * until then, matching `ConnState`'s own "not connected yet" value.
+ */
+export function useConnectionState(client: DataClient | undefined): ConnState {
+  const [state, setState] = useState<ConnState>(() => client?.getConnState() ?? 'idle');
 
-  useEffect(() => client.onConnState((event) => setState(event.state)), [client]);
+  useEffect(() => {
+    if (!client) return;
+    setState(client.getConnState());
+    return client.onConnState((event) => setState(event.state));
+  }, [client]);
 
   return state;
 }

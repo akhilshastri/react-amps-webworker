@@ -13,9 +13,8 @@ import { toSubscriptionId } from '@amps-ui/protocol';
 import { Button } from '@amps-ui/ui';
 import type { DataClient, SubscriptionHandle } from '@amps-ui/worker-client';
 import { useEffect, useRef, useState } from 'react';
-import { TabFooter } from '../footer/tab-footer';
-import { useSubscriptionStats } from '../footer/use-subscription-stats';
 import { useTabState } from '../tab-state';
+import { TabFrame } from './tab-frame';
 
 export function OrdersTabContent({
   client,
@@ -34,10 +33,8 @@ export function OrdersTabContent({
     return () => opened.close();
   }, [client, instanceId]);
 
-  const stats = useSubscriptionStats(handle);
-
   return (
-    <div className="flex h-full flex-col">
+    <TabFrame handle={handle}>
       <div className="flex shrink-0 items-center justify-end gap-2 border-b px-2 py-1">
         <Button size="sm" variant="outline" onClick={() => gridRef.current?.clearSelection()}>
           Clear selection
@@ -53,7 +50,6 @@ export function OrdersTabContent({
           />
         )}
       </div>
-      <TabFooter stats={stats} />
-    </div>
+    </TabFrame>
   );
 }

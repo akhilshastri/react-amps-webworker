@@ -4,15 +4,14 @@
 // close driven by `selectedOrders`, see its own header) -- this component's
 // only job is resolving WHICH selection to follow (`config.sourceOrdersTabId`,
 // `../model.ts`) and forwarding the resulting handle to the shared
-// `<TabFooter>` (plan §5: real `stats` events, not a mock).
+// `<TabFrame>`/`<TabFooter>` (plan §5: real `stats` events, not a mock).
 import { OrderDetailsGrid } from '@amps-ui/feature-order-details';
 import { toSubscriptionId } from '@amps-ui/protocol';
 import type { DataClient, SubscriptionHandle } from '@amps-ui/worker-client';
 import { useState } from 'react';
-import { TabFooter } from '../footer/tab-footer';
-import { useSubscriptionStats } from '../footer/use-subscription-stats';
 import type { TabConfig } from '../model';
 import { useTabState } from '../tab-state';
+import { TabFrame } from './tab-frame';
 
 export function OrderDetailsTabContent({
   client,
@@ -27,10 +26,9 @@ export function OrderDetailsTabContent({
   const sourceId = config.sourceOrdersTabId ?? config.instanceId;
   const [sourceState] = useTabState(sourceId);
   const [handle, setHandle] = useState<SubscriptionHandle | undefined>(undefined);
-  const stats = useSubscriptionStats(handle);
 
   return (
-    <div className="flex h-full flex-col">
+    <TabFrame handle={handle}>
       <div className="min-h-0 flex-1">
         <OrderDetailsGrid
           client={client}
@@ -39,7 +37,6 @@ export function OrderDetailsTabContent({
           onHandleChange={setHandle}
         />
       </div>
-      <TabFooter stats={stats} />
-    </div>
+    </TabFrame>
   );
 }
