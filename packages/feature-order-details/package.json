@@ -12,6 +12,8 @@
     "@amps-ui/grid-viewport": "workspace:*",
     "@amps-ui/protocol": "workspace:*",
     "@amps-ui/ui": "workspace:*",
+    "@amps-ui/worker-client": "workspace:*",
+    "ag-grid-community": "36.1.0",
     "react": "19.2.8"
   },
   "peerDependencies": {

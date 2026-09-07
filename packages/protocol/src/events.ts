@@ -1,6 +1,6 @@
 // worker -> main messages (plan §3 "worker -> main (WorkerEvent)" table).
 import type { Epoch, PROTOCOL_VERSION, SubscriptionId } from './brands';
-import type { ConnState, SparseRowMap } from './shared';
+import type { ConnState, SparseRowMap, WindowSpec } from './shared';
 
 interface Envelope<Type extends string> {
   readonly v: typeof PROTOCOL_VERSION;
@@ -89,13 +89,24 @@ export interface RowsRemovedEvent extends Envelope<'rows.removed'> {
   readonly rowCount: number;
 }
 
-/** <=1/sec; feeds the footer and the "idle is expected" hint. */
+/**
+ * <=1/sec; feeds the footer and the "idle is expected" hint.
+ *
+ * `window` (M4b addition): the AMPS-paginated window currently loaded, when
+ * this subscription has one (plan §4/§5's footer requirement -- "window
+ * S..S+W loaded" -- needs the *pagination* bounds, not the on-screen
+ * scroll range; the worker can silently reposition this via its own
+ * autonomous repage, per C5, so the main thread cannot just remember what
+ * it originally asked for -- it has to be told). `undefined` for an
+ * unwindowed subscription (e.g. the 1,000-row `orders` grid).
+ */
 export interface StatsEvent extends Envelope<'stats'> {
   readonly subId: SubscriptionId;
   readonly epoch: Epoch;
   readonly rowCount: number;
   readonly updatesApplied: number;
   readonly lastTickAt: number;
+  readonly window?: WindowSpec;
 }
 
 /**

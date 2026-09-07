@@ -58,6 +58,11 @@ function loadSnapshot(
   sink.onSnapshotComplete(rows.length, 10);
 }
 
+/** Lets pending promise chains (e.g. `flush()`'s fire-and-forget `performRepage`) settle before assertions run -- `flush()` itself is synchronous and never awaits the re-subscription it kicks off. */
+function flushMicrotasks(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 function fakeClock(startAt = 0) {
   let now = startAt;
   return {
@@ -836,6 +841,229 @@ describe('createWorkerRuntime', () => {
 
       runtime.handleMessage({ v: 2, type: 'sub.viewport', subId, firstRow: 100, lastRow: 110 });
       expect(events.filter((e) => e.type === 'rows.reset')).toHaveLength(1);
+    });
+  });
+
+  describe('AMPS-paginated window (plan §4/C5, M4b)', () => {
+    test('a windowed sub.open reports the true rowCountHint total, distinct from the loaded window size', async () => {
+      const fake = fakeConnection();
+      const events: WorkerEvent[] = [];
+      const runtime = createWorkerRuntime({
+        connection: fake.connection,
+        post: (e) => events.push(e),
+        clock: () => 0,
+      });
+      const subId = toSubscriptionId('sub-1');
+      await runtime.handleMessage({
+        v: 2,
+        type: 'sub.open',
+        subId,
+        epoch: toEpoch(1),
+        topic: 'order_details',
+        mode: 'sow_and_delta_subscribe',
+        filter: "/orderId IN ('ORD-1','ORD-2')",
+        orderBy: '/detailId ASC',
+        batchSize: 2000,
+        keyField: 'detailId',
+        window: { topN: 2, skipN: 0 },
+        rowCountHint: 9968, // plan §4's worked example: sum(childCount) over the selection
+      });
+      const sink = fake.sinkFor(subId);
+      loadSnapshot(sink, [
+        { key: 'a', data: { detailId: 'a' } },
+        { key: 'b', data: { detailId: 'b' } },
+      ]);
+
+      const reset = events.find((e) => e.type === 'rows.reset');
+      if (reset?.type !== 'rows.reset') throw new Error('expected rows.reset');
+      expect(reset.rowCount).toBe(9968); // true total, not the 2-row loaded window
+      const complete = events.find((e) => e.type === 'snapshot.complete');
+      if (complete?.type !== 'snapshot.complete') throw new Error('expected snapshot.complete');
+      expect(complete.rowCount).toBe(2); // "loaded", distinct from "true total" (plan §4)
+    });
+
+    test('a live row entering a windowed subscription trims the tail back to top_n -- AMPS never oofs a displaced row', async () => {
+      const fake = fakeConnection();
+      const events: WorkerEvent[] = [];
+      const runtime = createWorkerRuntime({
+        connection: fake.connection,
+        post: (e) => events.push(e),
+        clock: () => 0,
+      });
+      const subId = toSubscriptionId('sub-1');
+      await runtime.handleMessage({
+        v: 2,
+        type: 'sub.open',
+        subId,
+        epoch: toEpoch(1),
+        topic: 'order_details',
+        mode: 'sow_and_delta_subscribe',
+        batchSize: 2000,
+        keyField: 'detailId',
+        sort: { mode: 'local', fields: [{ field: 'v', direction: 'desc' }] },
+        window: { topN: 3, skipN: 0 },
+      });
+      const sink = fake.sinkFor(subId);
+      loadSnapshot(sink, [
+        { key: 'a', data: { detailId: 'a', v: 30 } },
+        { key: 'b', data: { detailId: 'b', v: 20 } },
+        { key: 'c', data: { detailId: 'c', v: 10 } },
+      ]);
+      events.length = 0;
+
+      // 'd' has never been seen before -- exactly the scenario the spike
+      // measured (a row newly ranking into the top_n, delivered live with
+      // no snapshot). It ranks in ahead of 'b' and 'c'.
+      sink.onDelta('d', { detailId: 'd', v: 25 });
+
+      const resets = events.filter((e) => e.type === 'rows.reset');
+      expect(resets).toHaveLength(1);
+      const reset = resets[0];
+      if (reset?.type !== 'rows.reset') throw new Error('expected rows.reset');
+      expect(reset.rowCount).toBe(3); // still bounded at top_n, not 4
+      expect(reset.rows).toEqual({
+        0: { detailId: 'a', v: 30 },
+        1: { detailId: 'd', v: 25 },
+        2: { detailId: 'b', v: 20 },
+      }); // 'c' (now worst-ranked) fell off locally -- no oof ever arrives for it
+    });
+
+    test('stats reports the current AMPS-paginated window bounds, for the footer\'s "window S..S+W loaded"', async () => {
+      const fake = fakeConnection();
+      const events: WorkerEvent[] = [];
+      const clock = fakeClock();
+      const runtime = createWorkerRuntime({
+        connection: fake.connection,
+        post: (e) => events.push(e),
+        clock: clock.now,
+      });
+      const subId = toSubscriptionId('sub-1');
+      await runtime.handleMessage({
+        v: 2,
+        type: 'sub.open',
+        subId,
+        epoch: toEpoch(1),
+        topic: 'order_details',
+        mode: 'sow_and_delta_subscribe',
+        batchSize: 2000,
+        keyField: 'detailId',
+        window: { topN: 2000, skipN: 0 },
+        rowCountHint: 9968,
+      });
+      const sink = fake.sinkFor(subId);
+      loadSnapshot(sink, [{ key: 'a', data: { detailId: 'a' } }]);
+      events.length = 0;
+
+      clock.advance(1000);
+      runtime.flush();
+
+      const stats = events.find((e) => e.type === 'stats');
+      if (stats?.type !== 'stats') throw new Error('expected stats');
+      expect(stats.window).toEqual({ topN: 2000, skipN: 0 });
+      expect(stats.rowCount).toBe(9968);
+    });
+
+    describe('worker-triggered repage (scrolling past the loaded window)', () => {
+      function keyAt(i: number): string {
+        return `k${String(i).padStart(4, '0')}`;
+      }
+
+      async function openWindowed(runtime: ReturnType<typeof createWorkerRuntime>, fake: ReturnType<typeof fakeConnection>, subId: SubscriptionId) {
+        await runtime.handleMessage({
+          v: 2,
+          type: 'sub.open',
+          subId,
+          epoch: toEpoch(1),
+          topic: 'order_details',
+          mode: 'sow_and_delta_subscribe',
+          orderBy: '/detailId ASC',
+          batchSize: 2000,
+          keyField: 'detailId',
+          window: { topN: 100, skipN: 0 },
+          rowCountHint: 10_000,
+        });
+        const sink = fake.sinkFor(subId);
+        loadSnapshot(
+          sink,
+          Array.from({ length: 100 }, (_, i) => ({ key: keyAt(i), data: { detailId: keyAt(i) } })),
+        );
+        fake.openedSpecs.length = 0;
+      }
+
+      test('a range outside the loaded window schedules a repage that fires once the debounce elapses', async () => {
+        const fake = fakeConnection();
+        const clock = fakeClock();
+        const runtime = createWorkerRuntime({
+          connection: fake.connection,
+          post: () => {},
+          clock: clock.now,
+        });
+        const subId = toSubscriptionId('sub-1');
+        await openWindowed(runtime, fake, subId);
+
+        // Global rows 500-520 -- well outside the loaded [0, 100) window.
+        runtime.handleMessage({ v: 2, type: 'sub.viewport', subId, firstRow: 500, lastRow: 520 });
+        expect(fake.openedSpecs).toHaveLength(0); // debounced -- not yet
+
+        clock.advance(149);
+        runtime.flush();
+        expect(fake.openedSpecs).toHaveLength(0); // not due yet (150ms debounce, constants.ts)
+
+        clock.advance(1);
+        runtime.flush();
+        await flushMicrotasks(); // performRepage's reissue is fire-and-forget from flush()
+        expect(fake.closed).toEqual([subId]);
+        expect(fake.openedSpecs).toHaveLength(1);
+        // skip_n = firstRow - overscan (20, constants.ts DEFAULT_OVERSCAN_ROWS), clamped to [0, total-topN].
+        expect(fake.openedSpecs[0]?.spec.window).toEqual({ topN: 100, skipN: 480 });
+      });
+
+      test('a range still covered by the loaded window (plus overscan) never repages', async () => {
+        const fake = fakeConnection();
+        const clock = fakeClock();
+        const runtime = createWorkerRuntime({
+          connection: fake.connection,
+          post: () => {},
+          clock: clock.now,
+        });
+        const subId = toSubscriptionId('sub-1');
+        await openWindowed(runtime, fake, subId);
+
+        runtime.handleMessage({ v: 2, type: 'sub.viewport', subId, firstRow: 10, lastRow: 30 });
+        clock.advance(200);
+        runtime.flush();
+
+        expect(fake.openedSpecs).toHaveLength(0);
+        expect(fake.closed).toHaveLength(0);
+      });
+
+      test('a later scroll before the debounce fires replaces the pending repage -- one re-subscription per fling, not one per callback', async () => {
+        const fake = fakeConnection();
+        const clock = fakeClock();
+        const runtime = createWorkerRuntime({
+          connection: fake.connection,
+          post: () => {},
+          clock: clock.now,
+        });
+        const subId = toSubscriptionId('sub-1');
+        await openWindowed(runtime, fake, subId);
+
+        runtime.handleMessage({ v: 2, type: 'sub.viewport', subId, firstRow: 500, lastRow: 520 });
+        clock.advance(100);
+        runtime.flush();
+        expect(fake.openedSpecs).toHaveLength(0); // 100ms since the first call -- not due
+
+        runtime.handleMessage({ v: 2, type: 'sub.viewport', subId, firstRow: 600, lastRow: 620 });
+        clock.advance(100);
+        runtime.flush();
+        expect(fake.openedSpecs).toHaveLength(0); // only 100ms since the SECOND call
+
+        clock.advance(50);
+        runtime.flush();
+        await flushMicrotasks();
+        expect(fake.openedSpecs).toHaveLength(1); // exactly one re-subscription for the whole fling
+        expect(fake.openedSpecs[0]?.spec.window).toEqual({ topN: 100, skipN: 580 }); // from the latest request (600 - 20)
+      });
     });
   });
 });

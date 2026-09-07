@@ -16,6 +16,7 @@ import type {
   GridReadyEvent,
   RowSelectionOptions,
   SelectionChangedEvent,
+  SortChangedEvent,
 } from 'ag-grid-community';
 import { themeQuartz } from 'ag-grid-community';
 import { AgGridReact } from 'ag-grid-react';
@@ -32,6 +33,7 @@ import {
 import { createWorkerViewportDatasource } from './datasource';
 import './modules';
 import { toSelectedRowKeys } from './selection';
+import type { SortColumnState } from './sort-filter-translate';
 import { useViewportSubscription } from './use-viewport-subscription';
 
 /** Status derived from the subscription's own events -- fuels the default footer. */
@@ -79,10 +81,13 @@ function defaultFooter(status: ViewportStatus): ReactNode {
   return `${status.rowCount ?? 0} rows`;
 }
 
-// Sorting/filtering is not wired in yet (plan §3: the Viewport row model
-// gets no sortModel/filterModel; that bridging is M3A). Until then, a
-// clickable sort/filter UI would silently do nothing, so both are off by
-// default -- matches AG Grid's own Viewport row model example.
+// Off by default -- matches AG Grid's own Viewport row model example. The
+// Viewport row model gets no sortModel/filterModel of its own (plan §3);
+// `onSortChanged`/`sortChanged` (above) is the bridge a caller uses instead,
+// and a caller that wants it must opt columns into `sortable: true` via its
+// own `defaultColDef`/`columnDefs` (e.g. `feature-order-details`, M4b).
+// Client-side column filtering (plan D3) is a separate opt-in this
+// component doesn't wire up yet.
 const DEFAULT_COL_DEF: ColDef = { sortable: false, filter: false, resizable: true };
 
 /**
@@ -133,9 +138,24 @@ export interface ViewportGridProps {
    * Fires whenever AG Grid's own `selectionChanged` fires, with the
    * selected rows' **keys** (via the same `getRowId` passed above) -- plan
    * §10 C2: row indices are meaningless across a re-sort or a details-
-   * window repage, but a `getRowId`-derived key survives both.
+   * window repage, but a `getRowId`-derived key survives both. Also passes
+   * the full row data (M4b addition) alongside the keys, since a caller
+   * that needs more than the key (e.g. `feature-orders`' selection store,
+   * which needs `childCount` for `projectDetailRowCount`) has no other way
+   * to reach it -- the Viewport row model's key->row mapping lives inside
+   * AG Grid, not in any store this package exposes.
    */
-  onSelectionChanged?: (keys: string[]) => void;
+  onSelectionChanged?: (keys: string[], rows: RowData[]) => void;
+  /**
+   * Fires whenever AG Grid's own `sortChanged` fires, with
+   * `api.getColumnState()` (plan §3: "listen to sortChanged/filterChanged,
+   * read api.getColumnState()/getFilterModel(), translate to a
+   * sub.update"). Translating this into a protocol `SortSpec` is the
+   * caller's job (`sort-filter-translate.ts`'s `translateSortModel`) since
+   * it needs topic-specific policy (`mode`, `nonStreamableFields`) this
+   * component has no opinion on (plan §1: stay topic-agnostic).
+   */
+  onSortChanged?: (columnState: SortColumnState[]) => void;
 }
 
 /** Imperative handle for operations that don't fit the declarative prop surface (plan §10 C2). */
@@ -162,6 +182,7 @@ export const ViewportGrid = forwardRef<ViewportGridHandle, ViewportGridProps>(fu
     renderFooter = defaultFooter,
     rowSelection,
     onSelectionChanged,
+    onSortChanged,
   },
   ref,
 ) {
@@ -189,9 +210,17 @@ export const ViewportGrid = forwardRef<ViewportGridHandle, ViewportGridProps>(fu
 
   const handleSelectionChanged = useCallback(
     (event: SelectionChangedEvent<RowData>) => {
-      onSelectionChanged?.(toSelectedRowKeys(event.api.getSelectedRows(), getRowId));
+      const rows = event.api.getSelectedRows();
+      onSelectionChanged?.(toSelectedRowKeys(rows, getRowId), rows);
     },
     [onSelectionChanged, getRowId],
+  );
+
+  const handleSortChanged = useCallback(
+    (event: SortChangedEvent<RowData>) => {
+      onSortChanged?.(event.api.getColumnState());
+    },
+    [onSortChanged],
   );
 
   const agRowSelection = useMemo(() => toAgRowSelection(rowSelection), [rowSelection]);
@@ -213,6 +242,7 @@ export const ViewportGrid = forwardRef<ViewportGridHandle, ViewportGridProps>(fu
           rowSelection={agRowSelection}
           onGridReady={handleGridReady}
           onSelectionChanged={agRowSelection ? handleSelectionChanged : undefined}
+          onSortChanged={onSortChanged ? handleSortChanged : undefined}
         />
       </div>
       <div className="viewport-grid-footer">{renderFooter(status)}</div>

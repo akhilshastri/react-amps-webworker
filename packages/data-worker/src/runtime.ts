@@ -21,7 +21,9 @@ import {
   type Epoch,
   PROTOCOL_VERSION,
   type PingRequest,
+  type RowData,
   type SortField,
+  type SparseRowMap,
   type SubCloseRequest,
   type SubOpenRequest,
   type SubUpdateRequest,
@@ -47,6 +49,7 @@ import {
   DEFAULT_INITIAL_WINDOW_ROWS,
   DEFAULT_OVERSCAN_ROWS,
   FLUSH_INTERVAL_MS,
+  REPAGE_DEBOUNCE_MS,
   SNAPSHOT_PROGRESS_THROTTLE_MS,
   STATS_INTERVAL_MS,
 } from './constants';
@@ -71,6 +74,22 @@ export interface WorkerRuntimeDeps {
   readonly clock: () => number;
 }
 
+/**
+ * A repage scheduled by `maybeScheduleRepage` but not yet fired -- the
+ * worker-side half of plan §4's "~150ms debounce" (there is no `sub.window`
+ * message from the main thread for this path; the worker decides on its
+ * own, per §3's `sub.viewport` gotcha table entry). `flush()` fires it once
+ * `REPAGE_DEBOUNCE_MS` has passed since the *last* `sub.viewport` that
+ * touched it, so a scroll fling collapses to one re-subscription.
+ */
+interface PendingRepage {
+  readonly skipN: number;
+  /** Local (already skip-adjusted) viewport range to seed the re-opened subscription's projection with, so the user's scroll position survives the repage instead of resetting to the top of the new window. */
+  readonly localFirstRow: number;
+  readonly localLastRow: number;
+  readonly requestedAt: number;
+}
+
 interface SubscriptionState {
   epoch: Epoch;
   spec: SubscriptionSpec;
@@ -80,6 +99,10 @@ interface SubscriptionState {
   sortFields: readonly SortField[];
   /** Client-side column filter (plan D3), applied over `rowStore` to decide `sortIndex` membership. `undefined` means "everything loaded is visible". */
   clientFilter: ClientFilterSpec | undefined;
+  /** True row count to report once `spec.window` is set (plan §4/M4b -- see `SubOpenRequest.rowCountHint`, protocol/requests.ts). `undefined` falls back to `sortIndex.length`. */
+  rowCountHint: number | undefined;
+  /** Debounced worker-triggered repage, if one is due (plan §4/C5). */
+  pendingRepage: PendingRepage | undefined;
   conflator: DirtyKeyConflator;
   projection: ViewportProjection;
   inSnapshot: boolean;
@@ -88,6 +111,15 @@ interface SubscriptionState {
   updatesApplied: number;
   lastTickAt: number;
   lastStatsAt: number;
+}
+
+/** Options threaded through `createState`/`openWithSpec`/`reissue` -- grouped because every re-subscription path (filter change, server-sort change, explicit or worker-triggered repage) needs to carry the same handful of things forward (plan §3/§4). */
+interface OpenOptions {
+  readonly sortFields: readonly SortField[];
+  readonly clientFilter: ClientFilterSpec | undefined;
+  readonly rowCountHint?: number;
+  /** Seeds the new subscription's viewport projection instead of defaulting to the top (plan §4: a worker-triggered repage must preserve the user's scroll position). */
+  readonly initialViewport?: { readonly firstRow: number; readonly lastRow: number };
 }
 
 export interface WorkerRuntime {
@@ -112,31 +144,39 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
   });
 
   /**
-   * @param sortFields Local sort order to build the initial comparator from.
-   *   Empty means "no explicit sort yet" -- falls back to `keyField ASC`
-   *   (M2's original default). Carried forward by the caller across a
-   *   filter/window re-issue so re-opening doesn't silently reset the sort.
-   * @param clientFilter Carried forward the same way (plan D3).
+   * `options.sortFields` empty means "no explicit sort yet" -- falls back to
+   * `keyField ASC` (M2's original default). Every field on `options` is
+   * carried forward by the caller across a filter/sort/window re-issue so
+   * re-opening never silently resets state that logically survives it (plan
+   * §3/§4) -- see `OpenOptions`'s own doc comment.
    */
-  function createState(
-    spec: SubscriptionSpec,
-    epoch: Epoch,
-    sortFields: readonly SortField[],
-    clientFilter: ClientFilterSpec | undefined,
-  ): SubscriptionState {
+  function createState(spec: SubscriptionSpec, epoch: Epoch, options: OpenOptions): SubscriptionState {
     const rowStore = new RowStore();
     const fields =
-      sortFields.length > 0 ? sortFields : [{ field: spec.keyField, direction: 'asc' as const }];
+      options.sortFields.length > 0
+        ? options.sortFields
+        : [{ field: spec.keyField, direction: 'asc' as const }];
     const sortIndex = new SortIndex(createKeyComparator(rowStore, createFieldComparator(fields)));
+    const projection = new ViewportProjection(DEFAULT_OVERSCAN_ROWS, DEFAULT_INITIAL_WINDOW_ROWS);
+    if (options.initialViewport) {
+      // Raw range is stored immediately; the real clamp happens once the
+      // snapshot completes and the actual row count is known (`reclamp`,
+      // called from `onSnapshotComplete` below) -- this is how a
+      // worker-triggered repage (plan §4) restores the exact viewport the
+      // user was scrolled to instead of resetting to the top of the window.
+      projection.setRange(options.initialViewport.firstRow, options.initialViewport.lastRow, 0);
+    }
     return {
       epoch,
       spec,
       rowStore,
       sortIndex,
       sortFields: fields,
-      clientFilter,
+      clientFilter: options.clientFilter,
+      rowCountHint: options.rowCountHint,
+      pendingRepage: undefined,
       conflator: new DirtyKeyConflator(clock),
-      projection: new ViewportProjection(DEFAULT_OVERSCAN_ROWS, DEFAULT_INITIAL_WINDOW_ROWS),
+      projection,
       inSnapshot: true,
       snapshotRowCount: 0,
       lastProgressAt: 0,
@@ -144,6 +184,56 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
       lastTickAt: 0,
       lastStatsAt: 0,
     };
+  }
+
+  /** The row count to report to the main thread (plan §4/M4b): the true total once a `rowCountHint` is known, else whatever is actually loaded. */
+  function reportedRowCount(state: SubscriptionState): number {
+    return state.rowCountHint ?? state.sortIndex.length;
+  }
+
+  /** The AMPS-side pagination offset this subscription is currently loaded at, or 0 for an unwindowed one. */
+  function skipOf(state: SubscriptionState): number {
+    return state.spec.window?.skipN ?? 0;
+  }
+
+  /**
+   * Re-keys a `SparseRowMap`'s local (sortIndex-relative) indices into the
+   * AMPS-paginated window's global row space by adding `skip` -- e.g. index
+   * 0 in a subscription windowed at `skip_n=2000` is global row 2000, which
+   * is what AG Grid's viewport row model expects (plan §4). A `skip` of 0
+   * (the common, unwindowed case -- `orders`, or any details subscription
+   * before its first repage) returns the same object, no allocation.
+   */
+  function toGlobalRows(rows: SparseRowMap, skip: number): SparseRowMap {
+    if (skip === 0) return rows;
+    const shifted: Record<number, RowData> = {};
+    for (const [index, row] of Object.entries(rows)) {
+      shifted[Number(index) + skip] = row;
+    }
+    return shifted;
+  }
+
+  /**
+   * Enforces the AMPS-side `top_n` boundary locally (plan §4 CORRECTED /
+   * carry-forward C5, mandatory): a live paginated subscription pushes
+   * newly-qualifying rows into the window as their rank improves, but AMPS
+   * never sends `oof` for a row that falls back OUT of the top_n (measured:
+   * `/lastUpdated DESC`, top_n=1000, 37,748 rows displaced, zero `oof`).
+   * Without this the row store grows without bound. Trims from the tail of
+   * the sort index -- its comparator is built from the same `sortFields`
+   * carried forward alongside `spec.window` on every re-issue (`reissue`
+   * below), mirroring the AMPS `orderBy` that produced this window, so the
+   * worst-ranked keys are always at the end (sort-index.ts).
+   */
+  function trimToWindow(state: SubscriptionState): void {
+    const topN = state.spec.window?.topN;
+    if (topN === undefined) return;
+    while (state.sortIndex.length > topN) {
+      const key = state.sortIndex.keyAt(state.sortIndex.length - 1);
+      if (key === undefined) break;
+      state.sortIndex.removeKey(key);
+      state.rowStore.delete(key);
+    }
   }
 
   /**
@@ -181,8 +271,8 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
       type: 'rows.reset',
       subId,
       epoch: state.epoch,
-      rowCount: state.sortIndex.length,
-      rows,
+      rowCount: reportedRowCount(state),
+      rows: toGlobalRows(rows, skipOf(state)),
     });
   }
 
@@ -205,19 +295,25 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
       subId,
       epoch: state.epoch,
       keys: [key],
-      rowCount: state.sortIndex.length,
+      rowCount: reportedRowCount(state),
     });
     resetWindow(subId, state);
   }
 
   /**
-   * The mirror image of `onRowLeavesView`: a row already in `rowStore`
-   * starts matching the client filter after a delta. Insert it into the
-   * sort index at its correct position and send a fresh window -- a
-   * structural change, not a diff (plan §3), same as an `oof` removal.
+   * The mirror image of `onRowLeavesView`: a row not currently in the sort
+   * index starts belonging there -- either plan D3's client-filter case (a
+   * row starts matching after a delta) or, for a paginated details window,
+   * a row newly ranking into the AMPS `top_n` boundary that this client has
+   * never seen before (plan §4/C5 CORRECTED). Insert it at its correct
+   * position, enforce the `top_n` boundary locally (`trimToWindow` -- AMPS
+   * never `oof`s a row that falls back out of rank), then send a fresh
+   * window -- a structural change, not a diff (plan §3), same as an `oof`
+   * removal.
    */
   function onRowEntersView(subId: SubscriptionId, state: SubscriptionState, key: string): void {
     state.sortIndex.insertKey(key);
+    trimToWindow(state);
     state.projection.reclamp(state.sortIndex.length);
     resetWindow(subId, state);
   }
@@ -253,6 +349,11 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
         // Applies any carried-forward client filter (plan D3) rather than
         // indexing every loaded row unconditionally.
         refreshVisibleKeys(state);
+        // Defensive (plan §4/C5): AMPS's own `top_n` should already cap a
+        // paginated snapshot at this size, but enforcing it here too costs
+        // nothing and guards against any edge case landing more rows than
+        // requested.
+        trimToWindow(state);
         state.projection.reclamp(state.sortIndex.length);
         resetWindow(subId, state);
         post({
@@ -269,15 +370,37 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
       },
       onDelta: (key, patch) => {
         const existing = state.rowStore.get(key);
-        const row = existing ? mergeDelta(existing, patch) : patch;
-        if (!existing) state.rowStore.set(key, row); // defensive: a delta with no prior sow row (shouldn't happen for this protocol)
+
+        if (!existing) {
+          // A key neither in the snapshot nor previously delivered live.
+          // Two ways this happens: plan D3's client-filter case (a row
+          // starts matching only after this delta), or -- far more common
+          // for a live paginated details window -- plan §4/C5 CORRECTED: a
+          // row newly ranking into the AMPS `top_n` boundary. Either way it
+          // arrives as a raw partial patch (CLIENT.md: a delta carries only
+          // the changed fields), stored as-is since there is no prior
+          // record to merge it into; `onRowEntersView` (which enforces
+          // `trimToWindow`) is what keeps a windowed subscription bounded
+          // once this happens repeatedly.
+          state.rowStore.set(key, patch);
+          state.updatesApplied++;
+          state.lastTickAt = clock();
+          if (matchesClientFilter(patch, state.clientFilter)) {
+            onRowEntersView(subId, state, key);
+          }
+          return;
+        }
+
+        const row = mergeDelta(existing, patch);
         state.updatesApplied++;
         state.lastTickAt = clock();
 
         // No client filter active (the common case, and the only one M2
-        // exercised) -- every row is always visible, so skip straight to
-        // the fast path rather than paying an extra sortIndex lookup per
-        // tick on a hot path that can run at ~2,500 updates/sec (CLIENT.md).
+        // exercised) -- every row already in `rowStore` is already in
+        // `sortIndex` too (that invariant is what the `!existing` branch
+        // above maintains), so skip straight to the fast path rather than
+        // paying an extra sortIndex lookup per tick on a hot path that can
+        // run at ~2,500 updates/sec (CLIENT.md).
         if (!state.clientFilter) {
           state.conflator.mark(key);
           return;
@@ -312,31 +435,93 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
     subId: SubscriptionId,
     spec: SubscriptionSpec,
     epoch: Epoch,
-    sortFields: readonly SortField[],
-    clientFilter: ClientFilterSpec | undefined,
+    options: OpenOptions,
   ): Promise<void> {
-    const state = createState(spec, epoch, sortFields, clientFilter);
+    const state = createState(spec, epoch, options);
     subscriptions.set(subId, state);
     await connection.openSubscription(subId, spec, buildSink(subId, state));
   }
 
   /**
    * Closes the current AMPS subscription and re-opens it under a new epoch
-   * with `specPatch` merged over the previous spec, carrying `sortFields`/
-   * `clientFilter` forward. The shared shape behind a filter change, a
-   * server-sort change, and an explicit `sub.window` repage (plan §3/§4) --
-   * all three replace *what* AMPS sends while keeping *how it's viewed*.
+   * with `specPatch` merged over the previous spec, carrying `options`
+   * forward. The shared shape behind a filter change, a server-sort change,
+   * an explicit `sub.window` repage, and a worker-triggered repage
+   * (`performRepage` below) -- all four replace *what* AMPS sends while
+   * keeping *how it's viewed* (plan §3/§4).
    */
   async function reissue(
     subId: SubscriptionId,
     state: SubscriptionState,
     specPatch: Partial<SubscriptionSpec>,
     epoch: Epoch,
-    sortFields: readonly SortField[],
-    clientFilter: ClientFilterSpec | undefined,
+    options: OpenOptions,
   ): Promise<void> {
     await connection.closeSubscription(subId);
-    await openWithSpec(subId, { ...state.spec, ...specPatch }, epoch, sortFields, clientFilter);
+    await openWithSpec(subId, { ...state.spec, ...specPatch }, epoch, options);
+  }
+
+  /**
+   * Fires a repage scheduled by `maybeScheduleRepage` once its debounce has
+   * elapsed (`flush()` below). Guards against the subscription having moved
+   * on since it was scheduled -- a filter change, a sort change, or a tab
+   * close all replace or remove `subscriptions.get(subId)` before this
+   * fires, and `reissue`ing against a stale `state` would resurrect a
+   * superseded (or closed) subscription.
+   */
+  async function performRepage(
+    subId: SubscriptionId,
+    state: SubscriptionState,
+    repage: PendingRepage,
+  ): Promise<void> {
+    if (subscriptions.get(subId) !== state) return; // superseded meanwhile
+    const window = state.spec.window;
+    if (!window) return;
+    await reissue(subId, state, { window: { topN: window.topN, skipN: repage.skipN } }, state.epoch, {
+      sortFields: state.sortFields,
+      clientFilter: state.clientFilter,
+      rowCountHint: state.rowCountHint,
+      initialViewport: { firstRow: repage.localFirstRow, lastRow: repage.localLastRow },
+    });
+  }
+
+  /**
+   * Decides whether the just-received `sub.viewport` range needs the
+   * AMPS-side window repaged (plan §4: "scrolling past the loaded window
+   * repages"). `globalFirstRow`/`globalLastRow` are AG Grid's absolute row
+   * numbers -- the *reported* row count (plan §4's true total, e.g.
+   * `sum(childCount)`), not the local sort index, which only ever holds
+   * `window.topN` keys at a time. Debounced ~150ms (constants.ts) via
+   * `state.pendingRepage`, checked by `flush()` -- the worker's only timer
+   * (plan §3 gotcha: no `requestAnimationFrame` here).
+   */
+  function maybeScheduleRepage(
+    state: SubscriptionState,
+    globalFirstRow: number,
+    globalLastRow: number,
+  ): void {
+    const window = state.spec.window;
+    if (!window) return;
+
+    const loadedStart = window.skipN;
+    const loadedEnd = window.skipN + window.topN - 1;
+    const desiredStart = Math.max(0, globalFirstRow - DEFAULT_OVERSCAN_ROWS);
+    const desiredEnd = globalLastRow + DEFAULT_OVERSCAN_ROWS;
+    if (desiredStart >= loadedStart && desiredEnd <= loadedEnd) {
+      state.pendingRepage = undefined; // already covered by the current window
+      return;
+    }
+
+    const maxSkip = Math.max(0, reportedRowCount(state) - window.topN);
+    const nextSkip = Math.min(maxSkip, desiredStart);
+    if (nextSkip === window.skipN) return; // pinned at a boundary AMPS already gives us (e.g. the very end)
+
+    state.pendingRepage = {
+      skipN: nextSkip,
+      localFirstRow: Math.max(0, globalFirstRow - nextSkip),
+      localLastRow: Math.max(0, globalLastRow - nextSkip),
+      requestedAt: clock(),
+    };
   }
 
   async function handleConnOpen(msg: ConnOpenRequest): Promise<void> {
@@ -364,12 +549,17 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
       orderBy: msg.orderBy,
       batchSize: msg.batchSize,
       keyField: msg.keyField,
+      window: msg.window,
     };
     // A `sort` at open time only ever means 'local' -- a 'server' sort is
     // expressed directly as `msg.orderBy` above, since there is no
     // subscription yet to re-issue (protocol §3).
     const sortFields = msg.sort?.mode === 'local' ? msg.sort.fields : [];
-    await openWithSpec(msg.subId, spec, msg.epoch, sortFields, msg.clientFilter);
+    await openWithSpec(msg.subId, spec, msg.epoch, {
+      sortFields,
+      clientFilter: msg.clientFilter,
+      rowCountHint: msg.rowCountHint,
+    });
     post({ v: PROTOCOL_VERSION, type: 'sub.opened', subId: msg.subId, epoch: msg.epoch });
   }
 
@@ -380,17 +570,29 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
 
     if (msg.filter !== undefined) {
       // A filter change re-issues to AMPS entirely and starts a fresh
-      // snapshot under the new epoch (plan §3); any window is not carried
-      // forward -- a new filter means a new dataset from the top. Sort and
-      // client filter DO carry forward: they describe how to view whatever
-      // comes back, independent of which AMPS filter produced it.
+      // snapshot under the new epoch (plan §3). CORRECTED from the
+      // original comment here ("any window is not carried forward"): for a
+      // *windowed* subscription (plan §4's paginated details grid), the
+      // `top_n` bound MUST carry forward too, just reset to `skip_n=0` (a
+      // new selection is a new dataset "from the top" of its own ranking,
+      // not an unbounded one) -- dropping the window entirely on every
+      // selection change would try to stream the whole new selection
+      // unbounded, exactly the hazard `top_n` exists to prevent. Sort and
+      // client filter also carry forward: they describe how to view
+      // whatever comes back, independent of which AMPS filter produced it.
       await reissue(
         msg.subId,
         state,
-        { filter: msg.filter, window: undefined },
+        {
+          filter: msg.filter,
+          window: state.spec.window ? { topN: state.spec.window.topN, skipN: 0 } : undefined,
+        },
         msg.epoch,
-        msg.sort?.mode === 'local' ? msg.sort.fields : state.sortFields,
-        msg.clientFilter ?? state.clientFilter,
+        {
+          sortFields: msg.sort?.mode === 'local' ? msg.sort.fields : state.sortFields,
+          clientFilter: msg.clientFilter ?? state.clientFilter,
+          rowCountHint: msg.rowCountHint ?? state.rowCountHint,
+        },
       );
       return;
     }
@@ -406,8 +608,11 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
         state,
         { orderBy: buildOrderBy(msg.sort.fields) },
         msg.epoch,
-        msg.sort.fields,
-        msg.clientFilter ?? state.clientFilter,
+        {
+          sortFields: msg.sort.fields,
+          clientFilter: msg.clientFilter ?? state.clientFilter,
+          rowCountHint: msg.rowCountHint ?? state.rowCountHint,
+        },
       );
       return;
     }
@@ -444,9 +649,21 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
   function handleSubViewport(msg: SubViewportRequest): void {
     const state = subscriptions.get(msg.subId);
     if (!state) return;
+    const skip = skipOf(state);
     const previousStart = state.projection.windowStart;
     const previousEnd = state.projection.windowEnd;
-    state.projection.setRange(msg.firstRow, msg.lastRow, state.sortIndex.length);
+    // AG Grid's row numbers are global (plan §4); the local projection --
+    // and `sortIndex`/`rowStore`, which only ever hold `window.topN` keys --
+    // work in window-relative coordinates, so convert before clamping.
+    state.projection.setRange(
+      Math.max(0, msg.firstRow - skip),
+      Math.max(0, msg.lastRow - skip),
+      state.sortIndex.length,
+    );
+    // A windowed subscription may need its AMPS-side `skip_n` moved instead
+    // of (or in addition to) a local reclamp -- decided in global
+    // coordinates, independently of the local clamp above (plan §4).
+    maybeScheduleRepage(state, msg.firstRow, msg.lastRow);
     if (state.inSnapshot) return; // group_end's own rows.reset will already cover the current window
     // The main thread already coalesces rapid `setViewportRange` calls
     // before sending (plan §3); this is the worker-side half of that same
@@ -471,16 +688,13 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
     if (!state) return;
     if (isStaleEpoch(state.epoch, msg.epoch)) return;
     // Explicit AMPS-side repage -- the seam for M4's paginated details
-    // window (`options('top_n=take,skip_n=skip')`). Sort/filter carry
-    // forward the same way a filter change does (plan §4).
-    await reissue(
-      msg.subId,
-      state,
-      { window: { topN: msg.take, skipN: msg.skip } },
-      msg.epoch,
-      state.sortFields,
-      state.clientFilter,
-    );
+    // window (`options('top_n=take,skip_n=skip')`). Sort/filter/rowCountHint
+    // carry forward the same way a filter change does (plan §4).
+    await reissue(msg.subId, state, { window: { topN: msg.take, skipN: msg.skip } }, msg.epoch, {
+      sortFields: state.sortFields,
+      clientFilter: state.clientFilter,
+      rowCountHint: state.rowCountHint,
+    });
   }
 
   function handlePing(msg: PingRequest): void {
@@ -525,7 +739,13 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
           state.projection.windowEnd,
         );
         if (Object.keys(patch).length > 0) {
-          post({ v: PROTOCOL_VERSION, type: 'rows.patch', subId, epoch: state.epoch, rows: patch });
+          post({
+            v: PROTOCOL_VERSION,
+            type: 'rows.patch',
+            subId,
+            epoch: state.epoch,
+            rows: toGlobalRows(patch, skipOf(state)),
+          });
         }
       }
       if (now - state.lastStatsAt >= STATS_INTERVAL_MS) {
@@ -535,9 +755,31 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
           type: 'stats',
           subId,
           epoch: state.epoch,
-          rowCount: state.sortIndex.length, // visible (post-client-filter) count, matching resetWindow (plan D3)
+          rowCount: reportedRowCount(state), // true total once windowed (plan §4/M4b), else the visible post-client-filter count (plan D3)
           updatesApplied: state.updatesApplied,
           lastTickAt: state.lastTickAt,
+          window: state.spec.window,
+        });
+      }
+      // Worker-triggered repage, debounced (plan §4/C5): fires once
+      // `REPAGE_DEBOUNCE_MS` has passed since the last `sub.viewport` that
+      // scheduled or re-scheduled it (`maybeScheduleRepage`). Async and
+      // fire-and-forget like the rest of this pipeline's re-subscription
+      // paths -- errors are posted as `error` events rather than thrown
+      // across the worker boundary (plan §3).
+      if (state.pendingRepage && now - state.pendingRepage.requestedAt >= REPAGE_DEBOUNCE_MS) {
+        const repage = state.pendingRepage;
+        state.pendingRepage = undefined;
+        void performRepage(subId, state, repage).catch((error: unknown) => {
+          post({
+            v: PROTOCOL_VERSION,
+            type: 'error',
+            subId,
+            epoch: state.epoch,
+            code: 'repage-failed',
+            message: error instanceof Error ? error.message : String(error),
+            fatal: false,
+          });
         });
       }
     }

@@ -3,7 +3,7 @@
 // fields flattened in (not nested under a `payload` key), per plan §3:
 // "Every message: { v: 1, type, subId?, epoch?, ... }".
 import type { Epoch, PROTOCOL_VERSION, SubscriptionId } from './brands';
-import type { ClientFilterSpec, SortSpec, SubMode } from './shared';
+import type { ClientFilterSpec, SortSpec, SubMode, WindowSpec } from './shared';
 
 interface Envelope<Type extends string> {
   readonly v: typeof PROTOCOL_VERSION;
@@ -33,6 +33,22 @@ export interface SubOpenRequest extends Envelope<'sub.open'> {
   readonly keyField: string;
   readonly sort?: SortSpec;
   readonly clientFilter?: ClientFilterSpec;
+  /**
+   * Opens the subscription already paginated (M4b addition -- see
+   * `WindowSpec`, shared.ts, for why this needed to move earlier than the
+   * plan's original §3 table, which only added a window to `sub.window`).
+   */
+  readonly window?: WindowSpec;
+  /**
+   * The true row count to report for this subscription once it is
+   * windowed (plan §4: "the total row count stays exact... independent of
+   * what was fetched", e.g. `sum(childCount)` over an orders selection).
+   * The worker has no way to compute this itself -- a windowed
+   * `order_details` subscription never loads its parent `orders` rows --
+   * so the caller (main thread) supplies it. Ignored when `window` is
+   * absent; falls back to the loaded row count.
+   */
+  readonly rowCountHint?: number;
 }
 
 /**
@@ -46,6 +62,8 @@ export interface SubUpdateRequest extends Envelope<'sub.update'> {
   readonly filter?: string;
   readonly sort?: SortSpec;
   readonly clientFilter?: ClientFilterSpec;
+  /** See `SubOpenRequest.rowCountHint` -- carried forward across a filter-driven re-subscription (M4b addition). */
+  readonly rowCountHint?: number;
 }
 
 export interface SubCloseRequest extends Envelope<'sub.close'> {

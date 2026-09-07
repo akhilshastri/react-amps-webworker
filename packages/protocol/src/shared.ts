@@ -98,3 +98,27 @@ export type FilterCondition =
  * Grid's own default `filterModel` semantics).
  */
 export type ClientFilterSpec = Readonly<Record<string, FilterCondition>>;
+
+/**
+ * AMPS-side pagination window a subscription can request, either at open
+ * time or via a later `sub.window` repage (plan §4: `Command` has no
+ * `skipN()` and `topN()` is deprecated in favor of the free-form
+ * `options('top_n=W,skip_n=S')` string). M4b addition to `SubOpenRequest`
+ * (requests.ts) -- the plan's original §3 message table only added a
+ * `window` to the later `sub.window` repage, not to `sub.open` itself, but
+ * the details grid's very *first* subscription must already be bounded: an
+ * unbounded initial snapshot on a large selection would try to stream the
+ * whole thing before any follow-up `sub.window` could bound it (exactly the
+ * "never query `order_details` unfiltered" hazard CLIENT.md warns about,
+ * just reached one request later).
+ *
+ * Mirrors `@amps-ui/amps-client`'s worker-internal `SubscriptionWindow`
+ * (`subscription.ts`) -- duplicated rather than imported because
+ * `amps-client` is a worker-only package and `protocol` must stay
+ * dependency-free (plan §1) so both sides of the worker boundary can be
+ * built against it independently.
+ */
+export interface WindowSpec {
+  readonly topN: number;
+  readonly skipN: number;
+}
