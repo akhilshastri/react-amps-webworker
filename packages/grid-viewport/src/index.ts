@@ -15,6 +15,17 @@ import './modules';
 
 export { createWorkerViewportDatasource } from './datasource';
 export type { CreateViewportDatasourceOptions, ViewportSubscription } from './datasource';
+export { toSelectedRowKeys } from './selection';
+export { translateFilterModel, translateSortModel } from './sort-filter-translate';
+export type {
+  AgFilterModel,
+  FilterModelLike,
+  SetFilterModelLike,
+  SimpleFilterModelLike,
+  SortColumnState,
+  SortTranslation,
+  TranslateSortModelOptions,
+} from './sort-filter-translate';
 export { useViewportSubscription } from './use-viewport-subscription';
 export { ViewportGrid } from './viewport-grid';
-export type { ViewportGridProps, ViewportStatus } from './viewport-grid';
+export type { ViewportGridHandle, ViewportGridProps, ViewportStatus } from './viewport-grid';

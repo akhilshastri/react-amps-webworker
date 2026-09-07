@@ -55,7 +55,8 @@ export function M2Slice() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
       <div style={{ padding: '8px 12px', font: '13px system-ui', borderBottom: '1px solid #ccc' }}>
-        <strong>M2 slice</strong> — {ORDER_ID} — expecting <strong>{EXPECTED_ROWS.toLocaleString()}</strong> rows
+        <strong>M2 slice</strong> — {ORDER_ID} — expecting{' '}
+        <strong>{EXPECTED_ROWS.toLocaleString()}</strong> rows
         {' · '}connection: <strong>{conn}</strong>
       </div>
       <div style={{ flex: 1, minHeight: 0 }}>
@@ -68,7 +69,9 @@ export function M2Slice() {
               <div style={{ padding: '6px 12px', font: '12px system-ui' }}>
                 rows: <strong>{s.rowCount ?? '—'}</strong>
                 {s.loading ? ' · loading…' : ''}
-                {s.lastSnapshotElapsedMs !== undefined ? ` · snapshot ${s.lastSnapshotElapsedMs}ms` : ''}
+                {s.lastSnapshotElapsedMs !== undefined
+                  ? ` · snapshot ${s.lastSnapshotElapsedMs}ms`
+                  : ''}
                 {s.lastError ? ` · error: ${s.lastError}` : ''}
               </div>
             )}
