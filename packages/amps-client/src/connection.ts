@@ -3,15 +3,25 @@
 // `onState()`, plus `disconnect()` for the protocol's `conn.close`).
 //
 // Owns: connecting with exponential backoff (a NEW `Client` per attempt --
-// CLIENT.md is explicit that a failed instance is never retried), the
-// subscription registry (subId -> AMPS's own subscription id, needed to
-// `unsubscribe`), and translating `message.header.command()` into the
-// `SubscriptionSink` callbacks (subscription.ts).
+// CLIENT.md is explicit that a failed instance is never retried), detecting
+// an UNINTENTIONAL mid-session disconnect and running that same backoff
+// loop again on its own (plan §3/M5 -- CLIENT.md: "The client does not
+// reconnect automatically... wrap it"), the subscription registry (subId ->
+// AMPS's own subscription id, needed to `unsubscribe`), and translating
+// `message.header.command()` into the `SubscriptionSink` callbacks
+// (subscription.ts).
 //
 // `AmpsClientLike`/`AmpsMessageLike` are the minimal structural slice of
 // `amps`'s real `Client`/`Message` this class touches, so tests can supply
 // a fake client with zero network I/O. The real `Client` (via amps-shim.ts)
 // satisfies `AmpsClientLike` structurally -- see `defaultClientFactory`.
+//
+// Re-issuing subscriptions after a reconnect (CLIENT.md: "Subscriptions do
+// not survive a reconnect") is NOT this module's job -- it only reports the
+// state transition via `onState()`. `@amps-ui/data-worker`'s runtime.ts
+// (`resubscribeAll`) is what actually re-opens every live subscription once
+// `onState` reports `'open'` again, since it -- not this transport layer --
+// holds each subscription's current spec/sort/filter/viewport.
 //
 // Depends on: `amps` (via amps-shim.ts), `@amps-ui/protocol` (SubscriptionId only).
 // Consumed by: `@amps-ui/data-worker`.
@@ -32,6 +42,14 @@ export interface AmpsClientLike {
   disconnect(): Promise<unknown>;
   execute(command: unknown, handler: (message: AmpsMessageLike) => void): Promise<string>;
   unsubscribe(subId?: string): Promise<string>;
+  /**
+   * CLIENT.md's disconnect handler: "invoked in case of an unintentional
+   * disconnection" -- the only signal this module has that the WebSocket
+   * dropped mid-session (as opposed to this class's own `disconnect()`
+   * being called). Optional so existing test fakes that never exercise the
+   * reconnect path don't need to implement it.
+   */
+  disconnectHandler?(handler: (client: AmpsClientLike, error: Error) => void): unknown;
 }
 
 export type ConnLifecycleState = 'connecting' | 'open' | 'reconnecting' | 'closed' | 'failed';
@@ -73,6 +91,15 @@ export class AmpsConnection {
   private readonly initialBackoffMs: number;
   private readonly maxBackoffMs: number;
   private readonly maxAttempts: number;
+  /**
+   * Bumped by `disconnect()` and by every fresh `connect()`/auto-reconnect
+   * start. A backoff loop captures the generation it was started under and
+   * checks it before every side effect, so an intentional `disconnect()` --
+   * or a newer reconnect attempt superseding an older one -- can tell a
+   * stale loop it's no longer wanted instead of that loop resurrecting a
+   * connection nobody asked for anymore.
+   */
+  private generation = 0;
 
   constructor(options: AmpsConnectionOptions = {}) {
     this.clientFactory = options.clientFactory ?? defaultClientFactory;
@@ -101,11 +128,42 @@ export class AmpsConnection {
    */
   async connect(uri: string, clientName: string): Promise<void> {
     this.emit({ state: 'connecting' });
-    for (let attempt = 0; ; attempt++) {
+    const generation = ++this.generation;
+    await this.connectLoop(uri, clientName, generation, 0);
+  }
+
+  /**
+   * The backoff retry loop shared by the initial `connect()` and an
+   * autonomous reconnect after an unintentional drop (`wireAutoReconnect`
+   * below) -- CLIENT.md: a new `Client` per attempt, never retry a failed
+   * one. `generation` is captured by the caller and re-checked before every
+   * side effect so a `disconnect()` (or a newer reconnect superseding this
+   * one) can cancel this loop outright.
+   */
+  private async connectLoop(
+    uri: string,
+    clientName: string,
+    generation: number,
+    startAttempt: number,
+  ): Promise<void> {
+    for (let attempt = startAttempt; ; attempt++) {
+      if (generation !== this.generation) return; // superseded -- another connect/disconnect won the race
       const client = this.clientFactory(clientName);
       try {
         await client.connect(uri);
+        if (generation !== this.generation) {
+          // Raced with a `disconnect()` (or a newer reconnect) while this
+          // handshake was in flight -- this client is unwanted; drop it
+          // rather than adopting it as `this.client`.
+          await client.disconnect().catch(() => {});
+          return;
+        }
         this.client = client;
+        // Stale AMPS-assigned subscription ids from before the drop belong
+        // to a now-dead `Client` instance and are meaningless on this new
+        // one (CLIENT.md: subscriptions do not survive a reconnect).
+        this.subscriptions.clear();
+        this.wireAutoReconnect(client, uri, clientName, generation);
         this.emit({ state: 'open' });
         return;
       } catch (error) {
@@ -121,9 +179,52 @@ export class AmpsConnection {
     }
   }
 
+  /**
+   * Registers CLIENT.md's `disconnectHandler` -- the signal for an
+   * UNINTENTIONAL disconnection (network drop, AMPS restart, ...), as
+   * opposed to this class's own `disconnect()` being called deliberately.
+   * Runs the same backoff loop `connect()` uses, restarted at attempt 0, so
+   * a mid-session drop recovers exactly like a cold start (0.5s -> 8s, a
+   * new `Client` per attempt) -- CLIENT.md is explicit the client itself
+   * never does this on its own.
+   */
+  private wireAutoReconnect(
+    client: AmpsClientLike,
+    uri: string,
+    clientName: string,
+    generation: number,
+  ): void {
+    client.disconnectHandler?.((_client, error) => {
+      // Guards against: (a) this callback firing after an intentional
+      // `disconnect()` already cleared `this.client`, and (b) a stray
+      // second callback if it somehow fired more than once -- either way,
+      // only the currently-owned client's callback, checked against the
+      // still-current generation, is allowed to start a reconnect loop.
+      if (this.client !== client || generation !== this.generation) return;
+      this.client = null;
+      this.subscriptions.clear();
+      const nextGeneration = ++this.generation;
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit({ state: 'reconnecting', attempt: 1, error: message });
+      // Fire-and-forget: nothing awaits an autonomous reconnect. `connectLoop`
+      // already emits 'failed' itself if `maxAttempts` is finite and gets
+      // exhausted; swallow the rejection here so that doesn't also surface
+      // as an unhandled promise rejection in the worker.
+      void this.connectLoop(uri, clientName, nextGeneration, 0).catch(() => {});
+    });
+  }
+
+  /**
+   * Intentional disconnect (the protocol's `conn.close`, and page/tab
+   * teardown). Cancels any in-flight connect/reconnect loop via the
+   * generation bump -- a handshake that resolves after this point must not
+   * resurrect a connection the caller explicitly asked to close.
+   */
   async disconnect(): Promise<void> {
+    this.generation++;
     const client = this.client;
     this.client = null;
+    this.subscriptions.clear();
     if (client) await client.disconnect().catch(() => {});
     this.emit({ state: 'closed' });
   }

@@ -176,9 +176,17 @@ export class DataClient {
       return;
     }
 
-    if (data.type === 'error' && data.subId === undefined) {
+    if (data.type === 'error') {
+      // Every `error` event reaches `onError` (plan §5/M5: "error events
+      // surfaced as toasts") regardless of whether it's connection-scoped
+      // or names a `subId` -- a subscription-scoped error (e.g. a failed
+      // resubscribe after a reconnect, data-worker's `resubscribe-failed`)
+      // is just as toast-worthy as a connection one. A connection-scoped
+      // error (no `subId`) has nowhere else to go, so it stops here; a
+      // subscription-scoped one also falls through to that subscription's
+      // own listeners below, unchanged from before this existed.
       for (const listener of this.errorListeners) listener(data);
-      return;
+      if (data.subId === undefined) return;
     }
 
     if (!('subId' in data) || data.subId === undefined) return;
@@ -191,6 +199,16 @@ export class DataClient {
     if ('epoch' in data && data.epoch !== undefined) {
       const current = this.epochBySubId.get(subId);
       if (current !== undefined && isStaleEpoch(toEpoch(current), data.epoch)) return;
+      // The worker can bump a subscription's epoch on its own -- reconnect
+      // re-issues every live subscription under a fresh epoch without any
+      // main-thread-initiated `sub.open`/`sub.update` (data-worker's
+      // `resubscribeAll`, plan §3/M5). Track that bump here too, not only
+      // epochs `allocateEpoch` handed out itself, or a future `update()`
+      // computed from stale bookkeeping could collide with (or trail
+      // behind) the epoch the worker is already serving.
+      if (current === undefined || data.epoch > current) {
+        this.epochBySubId.set(subId, data.epoch);
+      }
     }
 
     const listeners = this.listenersBySubId.get(subId);

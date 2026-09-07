@@ -196,6 +196,84 @@ describe('DataClient', () => {
     expect(worker.sent.at(-1)).toEqual({ v: PROTOCOL_VERSION, type: 'sub.close', subId });
   });
 
+  test('an epoch the worker bumped on its own (reconnect resubscribe, plan §3/M5) is tracked, so the NEXT update does not collide with it', () => {
+    const worker = new FakeWorker();
+    const client = new DataClient(worker);
+    const subId = toSubscriptionId('sub-a');
+    const handle = client.openSubscription({
+      subId,
+      topic: 't',
+      mode: 'sow',
+      batchSize: 10,
+      keyField: 'id',
+    });
+    expect(client.currentEpoch(subId)).toBe(toEpoch(0));
+
+    // The worker re-issued this subscription after a reconnect, jumping
+    // straight from epoch 0 to epoch 3 (data-worker's `resubscribeAll` --
+    // this client never called `updateSubscription` in between).
+    worker.emit({ v: PROTOCOL_VERSION, type: 'sub.opened', subId, epoch: toEpoch(3) });
+    expect(client.currentEpoch(subId)).toBe(toEpoch(3));
+
+    worker.sent.length = 0;
+    const nextEpoch = handle.update({ filter: '/x = 1' });
+
+    expect(nextEpoch).toBe(toEpoch(4)); // one past the worker-reported epoch, not 1 (which would collide)
+    expect(worker.sent).toEqual([
+      { v: PROTOCOL_VERSION, type: 'sub.update', subId, filter: '/x = 1', epoch: toEpoch(4) },
+    ]);
+  });
+
+  test('a subscription-scoped error also reaches onError (plan §5/M5: every error becomes a toast), in addition to its own subscription listeners', () => {
+    const worker = new FakeWorker();
+    const client = new DataClient(worker);
+    const subId = toSubscriptionId('sub-a');
+    const handle = client.openSubscription({
+      subId,
+      topic: 't',
+      mode: 'sow',
+      batchSize: 10,
+      keyField: 'id',
+    });
+    const errors: string[] = [];
+    const subscriptionEvents: string[] = [];
+    client.onError((event) => errors.push(event.code));
+    handle.onEvent((event) => subscriptionEvents.push(event.type));
+
+    worker.emit({
+      v: PROTOCOL_VERSION,
+      type: 'error',
+      subId,
+      epoch: toEpoch(0),
+      code: 'resubscribe-failed',
+      message: 'boom',
+      fatal: false,
+    });
+
+    expect(errors).toEqual(['resubscribe-failed']);
+    expect(subscriptionEvents).toEqual(['error']);
+  });
+
+  test('dispose() detaches from the worker (plan §5/M5 clean teardown) -- events after it reach nothing', () => {
+    const worker = new FakeWorker();
+    const client = new DataClient(worker);
+    const subId = toSubscriptionId('sub-a');
+    const handle = client.openSubscription({
+      subId,
+      topic: 't',
+      mode: 'sow',
+      batchSize: 10,
+      keyField: 'id',
+    });
+    const received: unknown[] = [];
+    handle.onEvent((event) => received.push(event));
+
+    client.dispose();
+    worker.emit({ v: PROTOCOL_VERSION, type: 'rows.count', subId, epoch: toEpoch(0), rowCount: 3 });
+
+    expect(received).toEqual([]); // the listener was removed -- no leaked delivery after teardown
+  });
+
   test('a connection-scoped error (no subId) is routed to onError, not any subscription', () => {
     const worker = new FakeWorker();
     const client = new DataClient(worker);

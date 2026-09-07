@@ -58,6 +58,10 @@ export {
 } from './components/ui/dropdown-menu';
 export { Separator } from './components/ui/separator';
 export { Toaster } from './components/ui/sonner';
+// Re-exported (rather than each consumer depending on `sonner` directly) so
+// this package stays the one place that owns "how a toast looks/behaves" --
+// plan §5/M5: "error events surfaced as shadcn toasts".
+export { toast } from 'sonner';
 export {
   Tooltip,
   TooltipContent,

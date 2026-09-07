@@ -420,6 +420,148 @@ describe('createWorkerRuntime', () => {
     expect(fake.closed).toEqual([subId]);
   });
 
+  describe('reconnect (plan §3/M5 -- CLIENT.md: "Subscriptions do not survive a reconnect")', () => {
+    test('every open subscription is re-issued and re-snapshotted under a bumped epoch, exactly once each -- no duplicates', async () => {
+      const fake = fakeConnection();
+      const events: WorkerEvent[] = [];
+      const runtime = createWorkerRuntime({
+        connection: fake.connection,
+        post: (e) => events.push(e),
+        clock: () => 0,
+      });
+      const subA = toSubscriptionId('sub-a');
+      const subB = toSubscriptionId('sub-b');
+      await runtime.handleMessage({
+        v: 2,
+        type: 'sub.open',
+        subId: subA,
+        epoch: toEpoch(3),
+        topic: 'order_details',
+        mode: 'sow_and_delta_subscribe',
+        filter: "/orderId = 'ORD-1'",
+        batchSize: 2000,
+        keyField: 'detailId',
+      });
+      await runtime.handleMessage({
+        v: 2,
+        type: 'sub.open',
+        subId: subB,
+        epoch: toEpoch(0),
+        topic: 'orders',
+        mode: 'sow_and_subscribe',
+        batchSize: 2000,
+        keyField: 'orderId',
+      });
+      loadSnapshot(fake.sinkFor(subA), [{ key: 'a', data: { detailId: 'a' } }]);
+      loadSnapshot(fake.sinkFor(subB), [{ key: 'ORD-1', data: { orderId: 'ORD-1' } }]);
+      fake.openedSpecs.length = 0;
+      fake.closed.length = 0;
+      events.length = 0;
+
+      // Simulates AmpsConnection's own auto-reconnect (amps-client/src/
+      // connection.ts): a drop, then success again once backoff completes.
+      fake.emitState({ state: 'reconnecting' });
+      fake.emitState({ state: 'open' });
+      await flushMicrotasks();
+
+      // Exactly one re-open per subId -- not zero, and critically not two
+      // (the "easiest thing to get wrong" per the M5 brief).
+      const reopenedSubIds = fake.openedSpecs.map((o) => o.subId).sort();
+      expect(reopenedSubIds).toEqual([subA, subB].sort());
+      // No explicit unsubscribe -- the connection that dropped already took
+      // the old AMPS-side subscriptions with it; there is nothing left to close.
+      expect(fake.closed).toEqual([]);
+
+      const opened = events.filter((e) => e.type === 'sub.opened');
+      const epochFor = (subId: SubscriptionId) =>
+        opened.find((e) => e.type === 'sub.opened' && e.subId === subId);
+      expect(epochFor(subA)).toMatchObject({ epoch: toEpoch(4) }); // bumped from 3
+      expect(epochFor(subB)).toMatchObject({ epoch: toEpoch(1) }); // bumped from 0
+
+      // Genuinely re-snapshotted (not stale carried-over data): each
+      // subscription's sink was replaced, so feeding the NEW sink produces
+      // fresh rows.reset/snapshot.complete events under the bumped epoch.
+      events.length = 0;
+      loadSnapshot(fake.sinkFor(subA), [{ key: 'a', data: { detailId: 'a' } }]);
+      const reset = events.find((e) => e.type === 'rows.reset');
+      if (reset?.type !== 'rows.reset') throw new Error('expected rows.reset');
+      expect(reset.epoch).toBe(toEpoch(4));
+    });
+
+    test('preserves filter/sort/rowCountHint/window and the scrolled viewport across the reconnect, not defaults', async () => {
+      const fake = fakeConnection();
+      const runtime = createWorkerRuntime({
+        connection: fake.connection,
+        post: () => {},
+        clock: () => 0,
+      });
+      const subId = toSubscriptionId('sub-1');
+      await runtime.handleMessage({
+        v: 2,
+        type: 'sub.open',
+        subId,
+        epoch: toEpoch(1),
+        topic: 'order_details',
+        mode: 'sow_and_delta_subscribe',
+        filter: "/orderId = 'ORD-1'",
+        orderBy: '/detailId ASC',
+        batchSize: 2000,
+        keyField: 'detailId',
+        window: { topN: 100, skipN: 200 },
+        rowCountHint: 9968,
+      });
+      loadSnapshot(
+        fake.sinkFor(subId),
+        Array.from({ length: 100 }, (_, i) => ({
+          key: `k${i}`,
+          data: { detailId: `k${i}` },
+        })),
+      );
+      // Scroll away from the top before the drop.
+      runtime.handleMessage({ v: 2, type: 'sub.viewport', subId, firstRow: 250, lastRow: 260 });
+      fake.openedSpecs.length = 0;
+
+      fake.emitState({ state: 'reconnecting' });
+      fake.emitState({ state: 'open' });
+      await flushMicrotasks();
+
+      expect(fake.openedSpecs).toHaveLength(1);
+      expect(fake.openedSpecs[0]?.spec).toMatchObject({
+        filter: "/orderId = 'ORD-1'",
+        orderBy: '/detailId ASC',
+        window: { topN: 100, skipN: 200 }, // exact same window, not reset to skip 0
+      });
+    });
+
+    test('a subscription closed before the reconnect completes is not resurrected', async () => {
+      const fake = fakeConnection();
+      const runtime = createWorkerRuntime({
+        connection: fake.connection,
+        post: () => {},
+        clock: () => 0,
+      });
+      const subId = toSubscriptionId('sub-1');
+      await runtime.handleMessage({
+        v: 2,
+        type: 'sub.open',
+        subId,
+        epoch: toEpoch(1),
+        topic: 'orders',
+        mode: 'sow',
+        batchSize: 100,
+        keyField: 'orderId',
+      });
+      await runtime.handleMessage({ v: 2, type: 'sub.close', subId });
+      fake.openedSpecs.length = 0;
+
+      fake.emitState({ state: 'reconnecting' });
+      fake.emitState({ state: 'open' });
+      await flushMicrotasks();
+
+      expect(fake.openedSpecs).toEqual([]); // a closed tab must not come back from the dead
+    });
+  });
+
   test('conn.open forwards conn.state transitions from the connection', async () => {
     const fake = fakeConnection();
     const events: WorkerEvent[] = [];

@@ -33,6 +33,7 @@ import {
   type WorkerEvent,
   type WorkerRequest,
   isStaleEpoch,
+  toEpoch,
 } from '@amps-ui/protocol';
 import {
   DirtyKeyConflator,
@@ -141,6 +142,18 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
       attempt: event.attempt,
       error: event.error,
     });
+    // Every transition to 'open' -- the initial connect AND any later
+    // autonomous reconnect after a drop (`AmpsConnection`'s own
+    // `disconnectHandler` wiring, amps-client/src/connection.ts) -- re-issues
+    // every subscription still tracked here. Nothing distinguishes "first
+    // connect" from "reconnected" at this call site, and nothing needs to:
+    // on the first connect `subscriptions` is always empty (no `sub.open`
+    // has reached this worker yet, since the main thread only sends one
+    // after `conn.open` resolves), so this is a true no-op then and only
+    // does real work on a genuine reconnect.
+    if (event.state === 'open') {
+      void resubscribeAll();
+    }
   });
 
   /**
@@ -483,6 +496,74 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
   ): Promise<void> {
     await connection.closeSubscription(subId);
     await openWithSpec(subId, { ...state.spec, ...specPatch }, epoch, options);
+  }
+
+  /**
+   * Re-issues AND re-snapshots every currently open subscription once the
+   * connection (re)reaches `'open'` (plan §3/M5; CLIENT.md: "Subscriptions
+   * do not survive a reconnect ... re-issue them, and re-snapshot, since
+   * you'll have missed updates while disconnected"). A no-op on the very
+   * first connect, when `subscriptions` is still empty.
+   *
+   * Each subscription gets a brand-new `SubscriptionState` (fresh
+   * `RowStore`/`SortIndex`/projection, via `openWithSpec` -> `createState`)
+   * under a LOCALLY bumped epoch -- plan §3's "bump the epoch so stale
+   * in-flight results are discarded" -- so any snapshot data still arriving
+   * from the connection that just dropped is now behind a superseded epoch
+   * and gets dropped by both sides' `isStaleEpoch` check. The main thread
+   * (`@amps-ui/worker-client`'s `DataClient`) tracks epochs it learns from
+   * ANY event, not only ones it allocated itself, specifically so this
+   * worker-driven bump can't desync its own epoch bookkeeping and cause a
+   * later `sub.update` to collide with (or trail behind) the epoch this
+   * worker is already serving.
+   *
+   * Carries the exact same spec (topic/filter/orderBy/window/batchSize) and
+   * view state (sort, client filter, row-count hint, viewport window)
+   * forward unmodified -- from the caller's perspective a reconnect should
+   * be a brief reloading flicker, not a reset to defaults. No `sub.close`
+   * (and no `connection.closeSubscription`) is sent first: the AMPS-side
+   * subscription is already gone along with the connection that dropped, so
+   * there is nothing to unsubscribe -- issuing a fresh one is not a
+   * duplicate.
+   */
+  async function resubscribeAll(): Promise<void> {
+    // Snapshotted up front: `openWithSpec` mutates `subscriptions` for each
+    // entry it processes (and a `sub.close` racing in from the main thread
+    // would too), so iterating the live Map while re-opening its own
+    // entries invites trouble.
+    const entries = Array.from(subscriptions.entries());
+    for (const [subId, state] of entries) {
+      if (subscriptions.get(subId) !== state) continue; // closed, or already superseded, meanwhile
+      const nextEpoch = toEpoch(state.epoch + 1);
+      try {
+        await openWithSpec(subId, state.spec, nextEpoch, {
+          sortFields: state.sortFields,
+          clientFilter: state.clientFilter,
+          rowCountHint: state.rowCountHint,
+          // Restores the exact scroll position the user was at instead of
+          // resetting to the top of the window (same reasoning as a
+          // worker-triggered repage, `performRepage` below).
+          initialViewport: {
+            firstRow: state.projection.windowStart,
+            lastRow: state.projection.windowEnd,
+          },
+        });
+        post({ v: PROTOCOL_VERSION, type: 'sub.opened', subId, epoch: nextEpoch });
+      } catch (error) {
+        // Never throw across the worker boundary (plan §3) -- one
+        // subscription failing to come back must not stop the rest of this
+        // loop from trying.
+        post({
+          v: PROTOCOL_VERSION,
+          type: 'error',
+          subId,
+          epoch: nextEpoch,
+          code: 'resubscribe-failed',
+          message: error instanceof Error ? error.message : String(error),
+          fatal: false,
+        });
+      }
+    }
   }
 
   /**

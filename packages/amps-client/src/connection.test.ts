@@ -75,6 +75,157 @@ describe('AmpsConnection.connect backoff', () => {
   });
 });
 
+describe('AmpsConnection auto-reconnect (plan §3/M5 -- CLIENT.md: the client never reconnects on its own)', () => {
+  /** A fake client whose `disconnectHandler` registration is capturable, so a test can simulate an unintentional drop by invoking it directly. */
+  function fakeClientWithCapturableDisconnectHandler(shouldFailConnect: () => boolean) {
+    let captured: ((client: AmpsClientLike, error: Error) => void) | undefined;
+    const client: AmpsClientLike = {
+      connect: async () => {
+        if (shouldFailConnect()) throw new Error('refused');
+        return {};
+      },
+      disconnect: async () => ({}),
+      execute: async () => 'unused',
+      unsubscribe: async () => 'unused',
+      disconnectHandler: (handler) => {
+        captured = handler;
+        return client;
+      },
+    };
+    return { client, fireDisconnect: (error: Error) => captured?.(client, error) };
+  }
+
+  /**
+   * A fire-and-forget reconnect loop advances on its own microtask/timer
+   * schedule (nothing in `AmpsConnection`'s public API returns a promise for
+   * it), so tests poll for a condition via macrotask ticks (each one drains
+   * every microtask queued so far, including chained `sleep()` resolutions
+   * from `fakeSleep`) rather than hand-counting `Promise.resolve()` hops.
+   */
+  async function waitUntil(predicate: () => boolean, maxTicks = 50): Promise<void> {
+    for (let i = 0; i < maxTicks && !predicate(); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
+
+  test('an unintentional disconnect triggers a fresh backoff reconnect with a brand-new Client, never the dead one', async () => {
+    const { sleep, delays } = fakeSleep();
+    const clients: ReturnType<typeof fakeClientWithCapturableDisconnectHandler>[] = [];
+    let failNextTwo = 0; // the reconnect fails its first 2 attempts, then succeeds
+    const clientFactory = (): AmpsClientLike => {
+      const index = clients.length;
+      const entry = fakeClientWithCapturableDisconnectHandler(() =>
+        index === 0 ? false : failNextTwo-- > 0,
+      );
+      clients.push(entry);
+      return entry.client;
+    };
+
+    const connection = new AmpsConnection({ clientFactory, sleep });
+    const states: string[] = [];
+    connection.onState((e) => states.push(e.state));
+
+    await connection.connect('ws://fake', 'test-client');
+    expect(clients).toHaveLength(1);
+    expect(states).toEqual(['connecting', 'open']);
+
+    failNextTwo = 2;
+    clients[0]?.fireDisconnect(new Error('socket closed'));
+    await waitUntil(() => states.at(-1) === 'open' && states.length > 2);
+
+    // A fresh Client every attempt -- the original (now-dead) one is never reused.
+    expect(clients.length).toBe(4); // 1 initial + 3 reconnect attempts (2 failed, 1 succeeded)
+    expect(new Set(clients.map((c) => c.client)).size).toBe(4);
+    expect(delays).toEqual([500, 1_000]);
+    expect(states).toEqual([
+      'connecting',
+      'open',
+      'reconnecting',
+      'reconnecting',
+      'reconnecting',
+      'open',
+    ]);
+  });
+
+  test('subscriptions are discarded on an unintentional disconnect -- closing one afterward is a no-op, not a call against a dead client', async () => {
+    const { sleep } = fakeSleep();
+    const entry = fakeClientWithCapturableDisconnectHandler(() => false);
+    let unsubscribeCalls = 0;
+    entry.client.unsubscribe = async () => {
+      unsubscribeCalls++;
+      return 'ok';
+    };
+    entry.client.execute = async () => 'amps-sub-xyz';
+    const connection = new AmpsConnection({ clientFactory: () => entry.client, sleep });
+
+    await connection.connect('ws://fake', 'c');
+    const subId = toSubscriptionId('sub-1');
+    await connection.openSubscription(
+      subId,
+      { topic: 'order_details', mode: 'sow', batchSize: 100, keyField: 'detailId' },
+      { onSowRow: () => {}, onSnapshotComplete: () => {}, onDelta: () => {}, onOof: () => {} },
+    );
+
+    entry.fireDisconnect(new Error('dropped'));
+    await connection.closeSubscription(subId);
+
+    expect(unsubscribeCalls).toBe(0); // the registry was cleared -- nothing to (wrongly) unsubscribe on the dead client
+  });
+
+  test('an explicit disconnect() cancels a reconnect loop that is still backing off, so the connection never silently comes back', async () => {
+    let resolveSleep: (() => void) | undefined;
+    const sleep = () =>
+      new Promise<void>((resolve) => {
+        resolveSleep = resolve;
+      });
+    const first = fakeClientWithCapturableDisconnectHandler(() => false);
+    let secondAttemptClient: AmpsClientLike | undefined;
+    let clientCount = 0;
+    const clientFactory = (): AmpsClientLike => {
+      clientCount++;
+      if (clientCount === 1) return first.client;
+      // Every reconnect attempt after the first fails, so the loop stays in backoff.
+      const client: AmpsClientLike = {
+        connect: async () => {
+          throw new Error('still down');
+        },
+        disconnect: async () => ({}),
+        execute: async () => 'unused',
+        unsubscribe: async () => 'unused',
+      };
+      secondAttemptClient = client;
+      return client;
+    };
+
+    const connection = new AmpsConnection({ clientFactory, sleep });
+    const states: string[] = [];
+    connection.onState((e) => states.push(e.state));
+
+    await connection.connect('ws://fake', 'c');
+    first.fireDisconnect(new Error('dropped'));
+    // Let the reconnect loop's first (failing) attempt run all the way to
+    // its `sleep()` call -- `resolveSleep` is only assigned once that call
+    // actually happens.
+    await waitUntil(() => resolveSleep !== undefined);
+
+    expect(secondAttemptClient).toBeDefined();
+    expect(states.at(-1)).toBe('reconnecting');
+
+    await connection.disconnect();
+    expect(states.at(-1)).toBe('closed');
+
+    // Let the backoff sleep resolve now that disconnect() has already bumped
+    // the generation -- the loop must see itself superseded and stop, not
+    // resurrect the connection with an 'open' state after an explicit close.
+    resolveSleep?.();
+    await waitUntil(() => false, 5); // a handful of macrotask ticks for the (superseded) loop to observe the bump and exit
+
+    expect(states.at(-1)).toBe('closed');
+    expect(states.includes('open')).toBe(true); // sanity: the initial connect did succeed once
+    expect(states.filter((s) => s === 'open')).toHaveLength(1); // but never again after the cancelled reconnect
+  });
+});
+
 describe('AmpsConnection.openSubscription', () => {
   function connectedConnectionWithHandler(): {
     connection: AmpsConnection;

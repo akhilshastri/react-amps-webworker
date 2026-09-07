@@ -21,11 +21,12 @@
 // have no in-flight connect to wait on. Gating child mount on `client`
 // being set guarantees `conn.open` is always sent first.
 import DataWorker from '@amps-ui/data-worker?worker';
-import { TooltipProvider } from '@amps-ui/ui';
+import { Toaster, TooltipProvider } from '@amps-ui/ui';
 import { DataClient } from '@amps-ui/worker-client';
 import { useEffect, useState } from 'react';
 import { ConnectionBanner } from './connection-banner/connection-banner';
 import { useConnectionState } from './connection-banner/use-connection-state';
+import { useErrorToasts } from './error-toasts';
 import { ShellLayout } from './shell-layout';
 import { TabStateProvider } from './tab-state';
 
@@ -42,13 +43,28 @@ export function Shell() {
     dataClient.connect(AMPS_URI, 'trading-ui');
     setClient(dataClient);
 
-    return () => {
+    // `dispose()`/`disconnect()` are also what a normal unmount runs below,
+    // via this same effect's cleanup -- but an actual browser tab/window
+    // close does not reliably run React's unmount cleanup (plan §5/M5:
+    // "clean teardown on tab close and page unload"). `pagehide` (rather
+    // than `beforeunload`, which is worse for the back/forward cache) is
+    // the extra trigger that covers that case; sharing one function means
+    // there is exactly one teardown path to keep correct, run from
+    // whichever event fires first.
+    const teardown = () => {
       dataClient.disconnect();
       dataClient.dispose();
+    };
+    window.addEventListener('pagehide', teardown);
+
+    return () => {
+      window.removeEventListener('pagehide', teardown);
+      teardown();
     };
   }, []);
 
   const connState = useConnectionState(client);
+  useErrorToasts(client);
 
   return (
     <TooltipProvider>
@@ -62,6 +78,7 @@ export function Shell() {
           )}
         </div>
       </div>
+      <Toaster />
     </TooltipProvider>
   );
 }
