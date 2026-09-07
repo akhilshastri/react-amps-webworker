@@ -435,6 +435,25 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
     };
   }
 
+  /**
+   * Waits out any in-flight `conn.open` before touching the AMPS
+   * connection. Fixes a real race (found in browser verification, not
+   * caught by unit tests because the fake `AmpsConnectionLike` they use
+   * connects synchronously): a consumer that calls `client.connect(...)`
+   * then `client.openSubscription(...)` back-to-back posts `conn.open` and
+   * `sub.open` in the same tick. `handleConnOpen` starts the (async)
+   * handshake and returns without blocking the worker's `onmessage` queue,
+   * so `sub.open` can reach `openWithSpec` while `connectPromise` is still
+   * pending -- without this wait, `AmpsConnection.openSubscription` throws
+   * "not connected" and the subscription is dead on arrival, even though
+   * the connection succeeds moments later. No-op if nothing is in flight
+   * (already connected, or `conn.open` was never sent -- the latter is a
+   * genuine caller bug this doesn't newly paper over).
+   */
+  async function awaitConnection(): Promise<void> {
+    if (connectPromise) await connectPromise;
+  }
+
   async function openWithSpec(
     subId: SubscriptionId,
     spec: SubscriptionSpec,
@@ -443,6 +462,7 @@ export function createWorkerRuntime(deps: WorkerRuntimeDeps): WorkerRuntime {
   ): Promise<void> {
     const state = createState(spec, epoch, options);
     subscriptions.set(subId, state);
+    await awaitConnection();
     await connection.openSubscription(subId, spec, buildSink(subId, state));
   }
 

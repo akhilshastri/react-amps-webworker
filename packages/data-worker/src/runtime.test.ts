@@ -437,6 +437,121 @@ describe('createWorkerRuntime', () => {
     expect(events.map((e) => e.type)).toEqual(['conn.state', 'conn.state']);
   });
 
+  describe('conn.open / sub.open race (browser-found regression)', () => {
+    // A real WebSocket handshake is never synchronous -- every other test
+    // in this file uses a fake whose `connect()` resolves immediately,
+    // which is exactly why this race went uncaught until browser
+    // verification: a consumer that calls `client.connect(...)` then
+    // `client.openSubscription(...)` back-to-back posts `conn.open` and
+    // `sub.open` in the same tick, and `sub.open` must not reach
+    // `AmpsConnection.openSubscription` before the handshake completes.
+    function fakeConnectionWithGatedConnect() {
+      const fake = fakeConnection();
+      let resolveConnect: () => void = () => {};
+      let rejectConnect: (error: Error) => void = () => {};
+      const gate = new Promise<void>((resolve, reject) => {
+        resolveConnect = resolve;
+        rejectConnect = reject;
+      });
+      fake.connection.connect = async () => {
+        await gate;
+      };
+      return { ...fake, resolveConnect, rejectConnect };
+    }
+
+    test('a sub.open posted immediately after conn.open (before the handshake settles) still produces a snapshot', async () => {
+      const fake = fakeConnectionWithGatedConnect();
+      const events: WorkerEvent[] = [];
+      const runtime = createWorkerRuntime({
+        connection: fake.connection,
+        post: (e) => events.push(e),
+        clock: () => 0,
+      });
+
+      // Fired back-to-back, exactly as a real caller does -- neither is
+      // awaited before the next is sent (matches `DataClient.connect()`
+      // immediately followed by `openSubscription()`).
+      const connectPromise = runtime.handleMessage({
+        v: 2,
+        type: 'conn.open',
+        uri: 'ws://x',
+        clientName: 'c',
+      });
+      const subId = toSubscriptionId('sub-1');
+      const openPromise = runtime.handleMessage({
+        v: 2,
+        type: 'sub.open',
+        subId,
+        epoch: toEpoch(1),
+        topic: 'order_details',
+        mode: 'sow_and_delta_subscribe',
+        filter: "/orderId = 'ORD-000426'",
+        batchSize: 2000,
+        keyField: 'detailId',
+      });
+
+      // The handshake is still pending -- must not have reached a
+      // disconnected client yet.
+      expect(fake.openedSpecs).toHaveLength(0);
+
+      fake.resolveConnect();
+      await connectPromise;
+      await openPromise;
+
+      expect(fake.openedSpecs).toHaveLength(1);
+      const sink = fake.sinkFor(subId);
+      loadSnapshot(sink, [{ key: 'a', data: { detailId: 'a' } }]);
+      expect(events.some((e) => e.type === 'snapshot.complete')).toBe(true);
+    });
+
+    test('sub.open fails (never reaching the connection) when the in-flight handshake ultimately fails', async () => {
+      const fake = fakeConnectionWithGatedConnect();
+      const runtime = createWorkerRuntime({
+        connection: fake.connection,
+        post: () => {},
+        clock: () => 0,
+      });
+
+      const connectPromise = runtime.handleMessage({
+        v: 2,
+        type: 'conn.open',
+        uri: 'ws://x',
+        clientName: 'c',
+      });
+      const openPromise = runtime.handleMessage({
+        v: 2,
+        type: 'sub.open',
+        subId: toSubscriptionId('sub-1'),
+        epoch: toEpoch(1),
+        topic: 'order_details',
+        mode: 'sow_and_delta_subscribe',
+        batchSize: 2000,
+        keyField: 'detailId',
+      });
+
+      // Attach rejection handlers before rejecting -- otherwise the two
+      // promises are briefly unobserved between `rejectConnect()` and the
+      // `expect(...).rejects` lines below, which Bun flags as an unhandled
+      // rejection even though this test does go on to handle it.
+      const connectSettled = connectPromise.then(
+        () => ({ ok: true as const }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      const openSettled = openPromise.then(
+        () => ({ ok: true as const }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+
+      fake.rejectConnect(new Error('handshake failed'));
+
+      const connectResult = await connectSettled;
+      expect(connectResult.ok).toBe(false);
+      const openResult = await openSettled;
+      expect(openResult.ok).toBe(false);
+      expect(fake.openedSpecs).toHaveLength(0);
+    });
+  });
+
   test('ping is answered by a pong carrying the same nonce (v2 gap closed)', () => {
     const fake = fakeConnection();
     const events: WorkerEvent[] = [];

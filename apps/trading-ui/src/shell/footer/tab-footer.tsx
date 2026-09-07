@@ -3,8 +3,8 @@
 // while loading, updates/sec, and the age of the last tick, so that a
 // legitimately quiet narrow filter reads as 'idle, expected' rather than
 // 'broken'"). Presentational only -- takes a `SubscriptionStats` snapshot
-// and renders it; the mock generator lives in `use-mock-subscription-stats.ts`
-// so M4 can swap the source without touching this component.
+// and renders it; the real source lives in `use-subscription-stats.ts`
+// (M4b swapped in M3B's mock generator here without touching this file).
 import { Badge, Separator, Tooltip, TooltipContent, TooltipTrigger } from '@amps-ui/ui';
 import type { ReactNode } from 'react';
 import { useEffect, useState } from 'react';

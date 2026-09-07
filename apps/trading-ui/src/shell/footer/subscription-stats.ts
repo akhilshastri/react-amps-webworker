@@ -1,8 +1,8 @@
 // The shape a per-tab footer needs, independent of where it comes from
 // (plan §5: "sourced from that tab's own `stats` / `rows.count` events ...
 // The footer also shows: snapshot progress while loading, updates/sec, and
-// the age of the last tick"). M3B feeds this from a mock generator
-// (`use-mock-subscription-stats.ts`); M4 feeds it from the real
+// the age of the last tick"). M3B fed this from a mock generator; M4b's
+// `use-subscription-stats.ts` feeds it from the real
 // `stats`/`snapshot.progress`/`snapshot.complete` worker events
 // (`@amps-ui/protocol`) without `<TabFooter>` itself changing.
 export type SubscriptionPhase = 'connecting' | 'snapshot' | 'live';

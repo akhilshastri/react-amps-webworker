@@ -1,6 +1,7 @@
 // App-level connection-state banner (plan §7 M3B). Presentational -- takes
 // the `ConnState` (`@amps-ui/protocol`, plan §3's `conn.state` payload) and
-// renders it; `use-mock-connection-state.ts` is the mock source for now.
+// renders it; `use-connection-state.ts` (M4b) is the real source, reading
+// the app's single `DataClient`.
 import type { ConnState } from '@amps-ui/protocol';
 import { Alert, AlertTitle } from '@amps-ui/ui';
 
