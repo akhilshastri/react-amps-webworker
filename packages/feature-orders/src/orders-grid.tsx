@@ -14,16 +14,23 @@
 // consumer" stance. `ref` forwards `<ViewportGrid>`'s `clearSelection()` so
 // the shell can wire an explicit "Clear selection" control (plan §10 C2:
 // the Viewport row model has no header-checkbox select-all).
+//
+// M7 (design spec §2.3): `instanceId` tints the selected-row background with
+// this tab's own accent colour (`accentSelectionTheme`, `@amps-ui/grid-viewport`)
+// instead of AG Grid's generic default -- the same colour as this tab's
+// label dot and, when a details tab follows it, its "Following" chip.
 import type { ViewportGridHandle, ViewportStatus } from '@amps-ui/grid-viewport';
-import { ViewportGrid } from '@amps-ui/grid-viewport';
+import { ViewportGrid, accentSelectionTheme } from '@amps-ui/grid-viewport';
 import type { RowData } from '@amps-ui/protocol';
 import type { SubscriptionHandle } from '@amps-ui/worker-client';
-import { type CSSProperties, type ReactNode, forwardRef } from 'react';
+import { type CSSProperties, type ReactNode, forwardRef, useMemo } from 'react';
 import { ORDERS_COLUMN_DEFS, getOrderRowId } from './columns';
 import type { Order } from './order';
 
 export interface OrdersGridProps {
   handle: SubscriptionHandle;
+  /** This tab's instance id -- drives the per-tab selection-tint accent (design spec §2.3). */
+  instanceId: string;
   className?: string;
   style?: CSSProperties;
   renderFooter?: (status: ViewportStatus) => ReactNode;
@@ -32,15 +39,21 @@ export interface OrdersGridProps {
 }
 
 export const OrdersGrid = forwardRef<ViewportGridHandle, OrdersGridProps>(function OrdersGrid(
-  { handle, className, style, renderFooter, onSelectionChanged }: OrdersGridProps,
+  { handle, instanceId, className, style, renderFooter, onSelectionChanged }: OrdersGridProps,
   ref,
 ) {
+  // A `Theme` object is meant to be built once per tab, not per row/cell
+  // (design spec §5) -- memoized on `instanceId`, which never changes for
+  // this tab's lifetime.
+  const theme = useMemo(() => accentSelectionTheme(instanceId), [instanceId]);
+
   return (
     <ViewportGrid
       ref={ref}
       handle={handle}
       columnDefs={ORDERS_COLUMN_DEFS}
       getRowId={(data: RowData) => getOrderRowId(data)}
+      theme={theme}
       className={className}
       style={style}
       renderFooter={renderFooter}

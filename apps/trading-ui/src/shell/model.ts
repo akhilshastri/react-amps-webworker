@@ -1,6 +1,10 @@
-// The flexlayout-react model for the tab shell (plan §5, amended).
+// The flexlayout-react model for the tab shell (plan §5, amended; layout
+// M7-amended -- see below).
 //
-// One row, one tabset, two tabs at startup: "Orders" and "Order Details".
+// One row, two side-by-side tabsets at startup, one tab each: "Orders"
+// (left) and "Order Details" (right) -- M7 (design spec `plan/notes/
+// M7-ux-design.md` §1.1) replaced the single shared tabset with this split
+// so both panes stay visible at once instead of hiding each other.
 // Every tab carries a `TabConfig` -- `{ kind, instanceId }` -- and the plan's
 // invariant is exact identity, not just a naming convention: "one tab = one
 // grid instance = one `subId` in the worker. The mapping is exactly
@@ -61,6 +65,17 @@ export function createTabJson(kind: TabKind, sourceOrdersTabId?: string): IJsonT
   };
 }
 
+// M7 (design spec §1.1): one `Row` -> two side-by-side `TabSet`s (Orders
+// left, Details right) instead of one shared tabset -- the layout change
+// this milestone is actually about. Weights are relative, not percentages;
+// flexlayout normalizes them and renders a draggable splitter between
+// sibling tabsets in a row automatically, no extra code. 38/62 rather than
+// 50/50: Details is the information-dense, live side a trader watches once
+// a selection is made (23 columns, 6 ticking); Orders is a picker with
+// fewer glanced-at columns at any moment.
+const ORDERS_TABSET_WEIGHT = 38;
+const DETAILS_TABSET_WEIGHT = 62;
+
 export function createInitialModelJson(): IJsonModel {
   const ordersTab = createTabJson('orders');
   const ordersInstanceId = (ordersTab.config as TabConfig).instanceId;
@@ -77,7 +92,13 @@ export function createInitialModelJson(): IJsonModel {
       children: [
         {
           type: 'tabset',
-          children: [ordersTab, detailsTab],
+          weight: ORDERS_TABSET_WEIGHT,
+          children: [ordersTab],
+        },
+        {
+          type: 'tabset',
+          weight: DETAILS_TABSET_WEIGHT,
+          children: [detailsTab],
         },
       ],
     },

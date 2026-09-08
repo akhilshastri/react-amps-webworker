@@ -23,6 +23,49 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
+/*
+ * M7 (design spec `plan/notes/M7-ux-design.md` §3.1): the two type faces a
+ * dense trading blotter needs -- Inter for everything, JetBrains Mono for
+ * the four identifier columns that must resist 0/O and 1/l/I misreads.
+ * Self-hosted via `@fontsource-variable`, no runtime logic, no external
+ * font-loading request.
+ */
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
+
+/*
+ * M7 §4.1: Radix Colors' scale steps are what supply this app's semantic
+ * colour tokens (§4.2 below) -- step 11 is designed to hit >=4.5:1 text
+ * contrast against the step 1/2 app background in BOTH light and dark, step
+ * 9 is the "solid background" step for dots/fills. Each `-dark.css` file
+ * redefines the same variable names scoped to `.dark`/`.dark-theme`, which
+ * lines up with this app's own `.dark`-class convention for free -- no
+ * per-mode aliasing needed here, unlike `@custom-variant dark` below (that
+ * one is Tailwind's `dark:` utility variant, a separate mechanism).
+ */
+@import "@radix-ui/colors/green.css";
+@import "@radix-ui/colors/green-dark.css";
+@import "@radix-ui/colors/red.css";
+@import "@radix-ui/colors/red-dark.css";
+@import "@radix-ui/colors/blue.css";
+@import "@radix-ui/colors/blue-dark.css";
+@import "@radix-ui/colors/orange.css";
+@import "@radix-ui/colors/orange-dark.css";
+@import "@radix-ui/colors/amber.css";
+@import "@radix-ui/colors/amber-dark.css";
+@import "@radix-ui/colors/slate.css";
+@import "@radix-ui/colors/slate-dark.css";
+@import "@radix-ui/colors/violet.css";
+@import "@radix-ui/colors/violet-dark.css";
+@import "@radix-ui/colors/cyan.css";
+@import "@radix-ui/colors/cyan-dark.css";
+@import "@radix-ui/colors/pink.css";
+@import "@radix-ui/colors/pink-dark.css";
+@import "@radix-ui/colors/indigo.css";
+@import "@radix-ui/colors/indigo-dark.css";
+@import "@radix-ui/colors/teal.css";
+@import "@radix-ui/colors/teal-dark.css";
+
 @source './components';
 
 @custom-variant dark (&:is(.dark *));
@@ -50,6 +93,8 @@
   --radius-md: calc(var(--radius) * 0.8);
   --radius-lg: var(--radius);
   --radius-xl: calc(var(--radius) * 1.4);
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", monospace;
 }
 
 :root {
@@ -95,11 +140,101 @@
   --ring: oklch(0.556 0 0);
 }
 
+/*
+ * M7 §4.2/§4.3 semantic tokens -- one block for both modes, since each value
+ * is a REFERENCE into whichever Radix scale import resolved for the current
+ * mode (light vs the `-dark.css` files above), not a literal. Never
+ * hand-picked hex: contrast is Radix's job (§4.1).
+ */
+:root,
+.dark {
+  /* P&L -- green/red reserved exclusively for gain/loss, never reused elsewhere. */
+  --pnl-positive-text: var(--green-11);
+  --pnl-positive-solid: var(--green-9);
+  --pnl-negative-text: var(--red-11);
+  --pnl-negative-solid: var(--red-9);
+
+  /* Side -- deliberately NOT green/red, so BUY/SELL never reads as a P&L signal. */
+  --side-buy-text: var(--blue-11);
+  --side-buy-bg: var(--blue-3);
+  --side-sell-text: var(--orange-11);
+  --side-sell-bg: var(--orange-3);
+
+  /* Status */
+  --status-new-text: var(--slate-11);
+  --status-new-bg: var(--slate-3);
+  --status-partial-text: var(--amber-11);
+  --status-partial-bg: var(--amber-3);
+  --status-filled-text: var(--green-11);
+  --status-filled-bg: var(--green-3);
+  /* CANCELLED is neutral-void, not "loss" -- reuses slate, not red. */
+  --status-cancelled-text: var(--slate-11);
+  --status-cancelled-bg: var(--slate-3);
+
+  /* Cell-flash pulse (§3.4) -- neutral, distinct from every semantic colour above. */
+  --flash-9: var(--amber-9);
+
+  /* Tab-accent identity dots (§2.1/§4.3) -- kept as an indirection layer so
+     the five-hue palette can change in one place later, rather than every
+     call site referencing e.g. `--violet-9` directly. */
+  --accent-violet-9: var(--violet-9);
+  --accent-violet-3: var(--violet-3);
+  --accent-cyan-9: var(--cyan-9);
+  --accent-cyan-3: var(--cyan-3);
+  --accent-pink-9: var(--pink-9);
+  --accent-pink-3: var(--pink-3);
+  --accent-indigo-9: var(--indigo-9);
+  --accent-indigo-3: var(--indigo-3);
+  --accent-teal-9: var(--teal-9);
+  --accent-teal-3: var(--teal-3);
+}
+
+/*
+ * M7 §3.4/§10.2 (RESOLVED): no `themeQuartz.withParams()` colour param
+ * exists for the data-changed cell-flash in ag-grid-community@36.1.0 --
+ * exhaustive grep of the shipped theming types found none, only
+ * `cellFlashDuration`/`cellFadeDuration`/`flashCells()`. `CellFlashService`
+ * toggles these two classes itself; only their COLOUR needs overriding here.
+ * Scoped under `.amps-grid` (the wrapper class every `<ViewportGrid>`
+ * instance carries, `packages/grid-viewport/src/viewport-grid.tsx`) so it
+ * can never leak onto an unrelated themed surface. Plain custom properties,
+ * so this follows `.dark` for free exactly like the JS-side theme params
+ * (§5) -- no JS theme-swap needed for the flash colour either.
+ */
+.amps-grid .ag-cell-data-changed {
+  background-color: var(--flash-9);
+}
+.amps-grid .ag-cell-data-changed-animation {
+  transition: background-color var(--ag-cell-fade-duration, 1000ms);
+}
+
+/*
+ * M7 §6 -- indeterminate sweep for the footer's snapshot-loading bar, used
+ * only where no `rowCountHint` exists to drive a determinate bar (the
+ * Orders grid's own snapshot; the Details grid has a hint and uses a plain
+ * width percentage instead, `tab-footer.tsx`).
+ */
+@keyframes snapshot-sweep {
+  from {
+    background-position: -40% 0;
+  }
+  to {
+    background-position: 140% 0;
+  }
+}
+.snapshot-progress-bar {
+  height: 2px;
+  background-image: linear-gradient(90deg, transparent, var(--status-partial-text) 50%, transparent);
+  background-size: 40% 100%;
+  background-repeat: no-repeat;
+  animation: snapshot-sweep 1.2s linear infinite;
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
   }
   body {
-    @apply bg-background text-foreground;
+    @apply bg-background text-foreground font-sans;
   }
 }

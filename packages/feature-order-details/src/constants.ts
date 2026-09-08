@@ -11,8 +11,15 @@
  */
 export const WINDOW_ROWS = 2_000;
 
-/** The amps client's own default batchSize is 10, far too small for a bulk load (brief/plan §3). */
-export const DETAILS_BATCH_SIZE = 2_000;
+/**
+ * The amps client's own default batchSize is 10, far too small for a bulk
+ * load (brief/plan §3). Tuned 2,000 -> 20,000 in M7 per
+ * `plan/notes/M6-measurements.md` (measured 2,002ms -> 1,346ms median on the
+ * AMPS leg of a snapshot load) -- this is the AMPS-side batch size, not
+ * `WINDOW_ROWS`, so it improves only that leg of load time (~7% of the
+ * total), not the client-side majority.
+ */
+export const DETAILS_BATCH_SIZE = 20_000;
 
 /** Default sort when nothing else is requested (plan §4: "Default sort stays `/detailId ASC`"). */
 export const DEFAULT_ORDER_BY = '/detailId ASC';

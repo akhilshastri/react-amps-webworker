@@ -8,7 +8,7 @@
 // an explicit "Clear selection" control (plan §10 C2: the Viewport row
 // model has no header-checkbox select-all).
 import { OrdersGrid, ordersSubscriptionSpec } from '@amps-ui/feature-orders';
-import type { ViewportGridHandle } from '@amps-ui/grid-viewport';
+import { type ViewportGridHandle, tabAccent } from '@amps-ui/grid-viewport';
 import { toSubscriptionId } from '@amps-ui/protocol';
 import { Button } from '@amps-ui/ui';
 import type { DataClient, SubscriptionHandle } from '@amps-ui/worker-client';
@@ -34,7 +34,7 @@ export function OrdersTabContent({
   }, [client, instanceId]);
 
   return (
-    <TabFrame handle={handle}>
+    <TabFrame handle={handle} accent={tabAccent(instanceId)}>
       <div className="flex shrink-0 items-center justify-end gap-2 border-b px-2 py-1">
         <Button size="sm" variant="outline" onClick={() => gridRef.current?.clearSelection()}>
           Clear selection
@@ -45,6 +45,7 @@ export function OrdersTabContent({
           <OrdersGrid
             ref={gridRef}
             handle={handle}
+            instanceId={instanceId}
             renderFooter={() => null}
             onSelectionChanged={(orders) => setTabState({ selectedOrders: orders })}
           />

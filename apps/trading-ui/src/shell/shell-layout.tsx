@@ -4,10 +4,12 @@
 // Kept separate from `shell.tsx` so the connection banner and the
 // `TabStateProvider` boundary don't get tangled up with flexlayout's own
 // model lifecycle.
+import { tabAccent } from '@amps-ui/grid-viewport';
 import { toSubscriptionId } from '@amps-ui/protocol';
 import type { DataClient } from '@amps-ui/worker-client';
 import { Actions, Layout, Model, type TabNode, type TabSetNode } from 'flexlayout-react';
 import { useState } from 'react';
+import { AccentDot } from './accent-dot';
 import { GridTab } from './grid-tab';
 import { GRID_COMPONENT, type TabConfig, createInitialModelJson } from './model';
 import { cloneActiveTab } from './tab-actions';
@@ -24,13 +26,27 @@ export function ShellLayout({ client }: { client: DataClient }) {
   function factory(node: TabNode) {
     if (node.getComponent() !== GRID_COMPONENT) return null;
     const config = node.getConfig() as TabConfig | undefined;
-    return config ? <GridTab config={config} client={client} /> : null;
+    return config ? <GridTab config={config} client={client} model={model} /> : null;
   }
 
   return (
     <Layout
       model={model}
       factory={factory}
+      // Design spec §2.1: every Orders tab gets a small accent dot before
+      // its label, deterministic from its own instanceId; the Details tab
+      // paired to it (`sourceOrdersTabId`) renders the SAME dot, so the two
+      // panes visually match without reading anything. A severed/independent
+      // Details tab (no `sourceOrdersTabId`) gets no dot -- there is nothing
+      // for it to match.
+      onRenderTab={(node, renderValues) => {
+        const config = node.getConfig() as TabConfig | undefined;
+        if (!config) return;
+        const accentSourceId =
+          config.kind === 'orders' ? config.instanceId : config.sourceOrdersTabId;
+        if (!accentSourceId) return;
+        renderValues.leading = <AccentDot accent={tabAccent(accentSourceId)} className="mr-1.5" />;
+      }}
       onAction={(action) => {
         // Plan §5: "Tab close intercepted via `onAction` on
         // `Actions.DELETE_TAB` -> `sub.close(subId)` before letting the

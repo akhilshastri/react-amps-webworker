@@ -9,6 +9,8 @@
 // a layout to be split into multiple tabsets by dragging, and each one
 // gets its own clone control (`shell-layout.tsx`'s `onRenderTabSet`), so
 // "the active tab" is unambiguous per click.
+import type { TabAccent } from '@amps-ui/grid-viewport';
+import { tabAccent } from '@amps-ui/grid-viewport';
 import { Actions, DockLocation, type Model, TabNode, type TabSetNode } from 'flexlayout-react';
 import { type TabConfig, createTabJson } from './model';
 import type { TabStateContextValue } from './tab-state';
@@ -42,4 +44,64 @@ export function cloneActiveTab(
   }
 
   model.doAction(Actions.addTab(cloneJson, tabSetNode.getId(), DockLocation.CENTER, -1, true));
+}
+
+/**
+ * One entry in the "Following ▾" / "Change ▾" picker (design spec
+ * §1.4/§2.2): every currently-open Orders tab, by name + its own accent dot
+ * colour (`AccentDot`, `./accent-dot.tsx`).
+ */
+export interface OrdersTabSummary {
+  readonly instanceId: string;
+  readonly name: string;
+  readonly accent: TabAccent;
+}
+
+/**
+ * Enumerates every open Orders tab live from the model (design spec §1.4).
+ * Deliberately NOT derived from React state -- with two tabsets, tabs can be
+ * added/closed/dragged anywhere, and this is only read at the moment a
+ * "Change ▾" menu opens (`order-details-tab-content.tsx`), so a fresh read
+ * off `model` is simpler than keeping a parallel list in sync.
+ */
+export function listOrdersTabs(model: Model): OrdersTabSummary[] {
+  const tabs: OrdersTabSummary[] = [];
+  model.visitNodes((node) => {
+    if (!(node instanceof TabNode)) return;
+    const config = node.getConfig() as TabConfig | undefined;
+    if (config?.kind !== 'orders') return;
+    tabs.push({
+      instanceId: config.instanceId,
+      name: node.getName(),
+      accent: tabAccent(config.instanceId),
+    });
+  });
+  return tabs;
+}
+
+/**
+ * Repoints a Details tab at a different Orders tab's selection, or severs it
+ * entirely (`sourceOrdersTabId: undefined`, "Independent selection"). The
+ * concrete fix for §1.4's gap: a details clone is deliberately severed from
+ * its source on creation (`cloneActiveTab` above), and with two tabsets each
+ * potentially holding more than one tab, there was previously no way to
+ * point a severed Details tab at a (possibly different) live Orders tab.
+ * Additive to the model -- `sourceOrdersTabId` already exists on
+ * `TabConfig`, this just updates it in place via flexlayout's own supported
+ * mechanism for editing a tab node's `config` (`TabNode.getConfig()`'s own
+ * doc comment shows this exact call shape).
+ */
+export function setDetailsSource(
+  model: Model,
+  detailsTabId: string,
+  sourceOrdersTabId: string | undefined,
+): void {
+  const node = model.getNodeById(detailsTabId);
+  if (!(node instanceof TabNode)) return;
+  const currentConfig = node.getConfig() as TabConfig;
+  model.doAction(
+    Actions.updateNodeAttributes(detailsTabId, {
+      config: { ...currentConfig, sourceOrdersTabId },
+    }),
+  );
 }

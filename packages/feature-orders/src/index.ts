@@ -11,6 +11,7 @@
 // Consumed by: `apps/trading-ui` (M4), and by `@amps-ui/feature-order-details`
 // (selection store only, per plan §1).
 export type { Order } from './order';
+export { OrderStatusBadge, SideBadge } from './badges';
 export { ORDERS_COLUMN_DEFS, getOrderRowId } from './columns';
 export {
   decimalsForMagnitude,

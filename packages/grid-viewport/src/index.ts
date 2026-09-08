@@ -7,6 +7,10 @@
 // Never learns the words "orders" or "childCount" (plan §1) -- that is
 // what keeps it reusable across the master and details grids.
 //
+// M7 (`plan/notes/M7-ux-design.md` §5) adds `theme.ts`: the shared
+// `blotterTheme` Theming-API skin and the `tabAccent()` hash both grids and
+// the shell's tab labels use to agree on one colour per tab instance.
+//
 // Depends on: React, ag-grid-{community,enterprise,react},
 // `@amps-ui/worker-client`, `@amps-ui/protocol`.
 // Consumed by: `apps/trading-ui` directly for M2's bare page;
@@ -17,6 +21,8 @@ export { createWorkerViewportDatasource } from './datasource';
 export type { CreateViewportDatasourceOptions, ViewportSubscription } from './datasource';
 export { toSelectedRowKeys } from './selection';
 export { translateFilterModel, translateSortModel } from './sort-filter-translate';
+export { TAB_ACCENTS, accentSelectionTheme, blotterTheme, tabAccent } from './theme';
+export type { TabAccent } from './theme';
 export type {
   AgFilterModel,
   FilterModelLike,

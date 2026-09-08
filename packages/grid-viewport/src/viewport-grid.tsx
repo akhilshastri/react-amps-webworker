@@ -11,14 +11,15 @@ import type { RowData, WorkerEvent } from '@amps-ui/protocol';
 import type { SubscriptionHandle } from '@amps-ui/worker-client';
 import type {
   ColDef,
+  ColGroupDef,
   GetRowIdParams,
   GridApi,
   GridReadyEvent,
   RowSelectionOptions,
   SelectionChangedEvent,
   SortChangedEvent,
+  Theme,
 } from 'ag-grid-community';
-import { themeQuartz } from 'ag-grid-community';
 import { AgGridReact } from 'ag-grid-react';
 import {
   type CSSProperties,
@@ -34,6 +35,7 @@ import { createWorkerViewportDatasource } from './datasource';
 import './modules';
 import { toSelectedRowKeys } from './selection';
 import type { SortColumnState } from './sort-filter-translate';
+import { blotterTheme } from './theme';
 import { useViewportSubscription } from './use-viewport-subscription';
 
 /** Status derived from the subscription's own events -- fuels the default footer. */
@@ -118,10 +120,24 @@ function toAgRowSelection(
 
 export interface ViewportGridProps {
   handle: SubscriptionHandle;
-  columnDefs: ColDef[];
+  /**
+   * Also accepts `ColGroupDef` (a two-row grouped header, design spec §3.3)
+   * -- confirmed safe against the Viewport row model (§10.1/§11: header
+   * grouping is a pure column-definition concern, unrelated to row
+   * grouping, which the Viewport row model genuinely doesn't support).
+   */
+  columnDefs: (ColDef | ColGroupDef)[];
   getRowId: (data: RowData) => string;
   defaultColDef?: ColDef;
   rowHeight?: number;
+  /**
+   * The AG Grid Theming-API theme (`./theme.ts`'s `blotterTheme` by
+   * default). A caller overrides this only to layer a per-instance param on
+   * top (e.g. `<OrdersGrid>`'s per-tab `selectedRowBackgroundColor` accent,
+   * `accentSelectionTheme`, design spec §2.3/§5) -- `blotterTheme` itself
+   * already carries every density/colour token both grids share.
+   */
+  theme?: Theme;
   className?: string;
   style?: CSSProperties;
   renderFooter?: (status: ViewportStatus) => ReactNode;
@@ -177,6 +193,7 @@ export const ViewportGrid = forwardRef<ViewportGridHandle, ViewportGridProps>(fu
     getRowId,
     defaultColDef = DEFAULT_COL_DEF,
     rowHeight,
+    theme = blotterTheme,
     className,
     style,
     renderFooter = defaultFooter,
@@ -227,12 +244,16 @@ export const ViewportGrid = forwardRef<ViewportGridHandle, ViewportGridProps>(fu
 
   return (
     <div
-      className={className}
+      // `amps-grid` scopes the cell-flash CSS override (`@amps-ui/ui`'s
+      // `index.css`, design spec §3.4/§10.2 -- no theme param exists for the
+      // flash colour in this AG Grid version) to exactly the grids that need
+      // it, never leaking onto an unrelated themed surface.
+      className={['amps-grid', className].filter(Boolean).join(' ')}
       style={{ display: 'flex', flexDirection: 'column', height: '100%', ...style }}
     >
       <div style={{ flex: 1, minHeight: 0 }}>
         <AgGridReact<RowData>
-          theme={themeQuartz}
+          theme={theme}
           rowModelType="viewport"
           viewportDatasource={datasource}
           columnDefs={columnDefs}

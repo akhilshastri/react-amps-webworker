@@ -37,7 +37,14 @@ import {
 import type { SubscriptionId } from '@amps-ui/protocol';
 import { Alert, AlertDescription, AlertTitle, Badge } from '@amps-ui/ui';
 import type { DataClient, SubscriptionHandle } from '@amps-ui/worker-client';
-import { type CSSProperties, useCallback, useEffect, useRef, useState } from 'react';
+import {
+  type CSSProperties,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from 'react';
 import { blockedFieldsMessage } from './blocked-sort-message';
 import { ORDER_DETAILS_COLUMN_DEFS, getOrderDetailRowId } from './columns';
 import {
@@ -47,6 +54,7 @@ import {
   SELECTION_DEBOUNCE_MS,
   WINDOW_ROWS,
 } from './constants';
+import { DetailsSkeleton } from './details-skeleton';
 
 const DETAILS_DEFAULT_COL_DEF = { resizable: true, sortable: true };
 
@@ -64,6 +72,16 @@ export interface OrderDetailsGridProps {
    * it's the only thing that can create it.
    */
   onHandleChange?: (handle: SubscriptionHandle | undefined) => void;
+  /**
+   * Rendered in place of the grid when `selectedOrders` is empty (design
+   * spec §8.1). Left as a caller-supplied node (rather than baked in here)
+   * because the richer version -- naming which Orders tab this pane follows,
+   * with its accent dot -- needs flexlayout `Model` access this package
+   * deliberately doesn't have (`apps/trading-ui/src/shell/grid-tab/order-details-tab-content.tsx`
+   * builds it). Falls back to a generic message so this component stays
+   * usable/testable standalone.
+   */
+  emptyState?: ReactNode;
 }
 
 export function OrderDetailsGrid({
@@ -73,10 +91,17 @@ export function OrderDetailsGrid({
   className,
   style,
   onHandleChange,
+  emptyState,
 }: OrderDetailsGridProps) {
   const [handle, setHandle] = useState<SubscriptionHandle | undefined>(undefined);
   const [blockedSortFields, setBlockedSortFields] = useState<readonly string[]>([]);
   const [loading, setLoading] = useState(false);
+  // Sticky for this component's lifetime once true (design spec §8.2): the
+  // skeleton is for "nothing has ever loaded here yet", not for every
+  // debounce cycle -- a later selection change on an already-populated pane
+  // keeps showing its OLD rows while the new snapshot streams in (plan §4),
+  // never regressing back to a skeleton.
+  const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
   const handleRef = useRef<SubscriptionHandle | undefined>(undefined);
 
   // `onHandleChange` is read through a ref rather than listed as an effect
@@ -148,7 +173,10 @@ export function OrderDetailsGrid({
     setLoading(true);
     return handle.onEvent((event) => {
       if (event.type === 'snapshot.progress') setLoading(true);
-      else if (event.type === 'snapshot.complete') setLoading(false);
+      else if (event.type === 'snapshot.complete') {
+        setLoading(false);
+        setHasLoadedOnce(true);
+      }
     });
   }, [handle]);
 
@@ -185,11 +213,28 @@ export function OrderDetailsGrid({
             renderFooter={renderFooter}
           />
         ) : (
-          <div className="flex h-full items-center justify-center p-6 text-center text-muted-foreground text-sm">
-            Select one or more orders to see their details.
+          (emptyState ?? (
+            <div className="flex h-full items-center justify-center p-6 text-center text-muted-foreground text-sm">
+              Select one or more orders to see their details.
+            </div>
+          ))
+        )}
+        {/* Design spec §8.2: on a genuinely first-ever load, don't leave a
+            fully blank grid visible while the snapshot streams in -- an
+            OVERLAY on top of it, not a conditional mount. `<ViewportGrid>`
+            above must stay mounted the whole time: its datasource's
+            `onEvent` subscription is what actually receives the snapshot's
+            `rows.reset` (the footer's `loading` comes from a SEPARATE
+            listener on the same handle, `use-subscription-stats.ts`) --
+            unmounting it here to show a skeleton would tear that
+            subscription down mid-snapshot and silently drop the very event
+            that would have populated the grid. */}
+        {handle && !hasLoadedOnce && loading && (
+          <div className="absolute inset-0 bg-background">
+            <DetailsSkeleton columnDefs={ORDER_DETAILS_COLUMN_DEFS} />
           </div>
         )}
-        {loading && (
+        {handle && hasLoadedOnce && loading && (
           <Badge variant="secondary" className="absolute top-2 right-2 shadow">
             Loading…
           </Badge>
