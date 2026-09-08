@@ -767,3 +767,42 @@ no say in how the header is structured.
 
 So §3.3's two-row header is safe. Only §10.4 (licence watermark placement) remains open, and that is
 a look-at-it check once the layout renders.
+
+---
+
+## 12. Implementation verified in a real browser (Windows Chrome via the WSL bridge)
+
+The M7 agent was killed by a session rate limit immediately before this step, so verification was
+done separately. All checks pass against live AMPS.
+
+| check | result |
+|---|---|
+| Side-by-side layout | **YES** — 2 tabsets, x=0/w=719 and x=727/w=1173 (the 38/62 split), draggable splitter |
+| Two-row header groups ("Order", "Classification") | render correctly — confirms §10.1's resolution |
+| Accent thread | tab dots render; details toolbar reads `● Following Orders · 3 orders · 256 rows` |
+| Empty state | *"No orders selected — Select rows in ● Orders to see their execution detail here."* |
+| Master → details | selecting 3 orders mounted the second grid and populated it |
+| Footer | `256 rows · window 0–2,000 loaded · 1/s · last tick 0s ago` — true total still distinct from loaded window |
+| **Cell flash after the theming rewrite** | **100 `ag-cell-data-changed` applications** in 40s on `markPrice`/`marketValue` — **no regression** |
+| Console | only the expected AG Grid licence watermark |
+
+### A false alarm worth recording
+
+The details pane showed `3 orders · 256 rows` while every visible row read `ORD-000001`, which
+looked like multi-select failing to aggregate. It is correct: `ORD-000001`/`2`/`3` have childCounts
+97 + 33 + 126 = **256**, verified directly against AMPS, and the default `/detailId ASC` sort simply
+puts all of `ORD-000001`'s rows at the top of the window. Do not "fix" this.
+
+### Note on the flash check method
+
+Flash was confirmed with a `MutationObserver`, not polling. This matters: an earlier polling attempt
+at 2.5s intervals caught **zero** flashes on working code, because a flash lasts ~500ms. Any future
+regression check for this must use the observer.
+
+### Still open
+
+- §10.4 — the AG Grid licence watermark's placement was not specifically inspected. No custom chrome
+  is floated over grid rows, so the spec's mitigation holds by construction.
+- The AMPS stop/restart acceptance test from M5 has not been run. M5 was deliberately forbidden from
+  it (it would have corrupted M6's concurrent measurements) and verified reconnect client-side
+  instead, by closing the worker's WebSocket directly.
